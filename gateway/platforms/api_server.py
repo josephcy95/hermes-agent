@@ -12,7 +12,7 @@ Exposes an HTTP server with endpoints:
 - POST /api/sessions               — create an empty Hermes session
 - GET/PATCH/DELETE /api/sessions/{session_id} — read/update/delete a session
 - GET  /api/sessions/{session_id}/messages — read session message history
-- POST /api/sessions/{session_id}/fork — branch a session using SessionDB lineage
+- POST /api/sessions/{session_id}/fork — full or point-in-time SessionDB fork
 - POST /api/sessions/{session_id}/chat[/stream] — chat with a persisted session
 - POST /v1/runs                    — start a run, returns run_id immediately (202)
 - GET  /v1/runs/{run_id}           — retrieve current run status
@@ -3127,6 +3127,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 "session_chat": True,
                 "session_chat_streaming": True,
                 "session_fork": True,
+                "session_fork_through_message_id": True,
+                "session_relationship_type": True,
                 "session_model_lock": True,
                 "admin_config_rw": False,
                 "jobs_admin": False,
@@ -3268,8 +3270,132 @@ class APIServerAdapter(BasePlatformAdapter):
             return default
         return min(parsed, maximum)
 
+    def _session_runtime_response(self, session: Dict[str, Any]) -> Dict[str, Any]:
+        """Return safe effective runtime metadata for a session row.
+
+        Session rows intentionally keep provider credentials and the raw
+        ``model_config`` private.  The public runtime shape mirrors the
+        already-advertised model-lock response and reports only effective
+        provider/model/reasoning plus enough provenance for a client to tell a
+        session override from inherited or global defaults.
+        """
+        config = self._parse_session_model_config(session.get("model_config"))
+        lock = config.get("browser_model_lock")
+        if not isinstance(lock, dict):
+            lock = {}
+        gateway_runtime = config.get("gateway_runtime")
+        if not isinstance(gateway_runtime, dict):
+            gateway_runtime = {}
+
+        persisted_model = self._clean_runtime_id(session.get("model"))
+        prefixed_provider, split_model = self._split_provider_prefixed_model(
+            persisted_model
+        )
+        route = self._resolve_route(persisted_model) or self._resolve_route(split_model)
+        route = dict(route) if isinstance(route, dict) else None
+
+        locked = _coerce_request_bool(lock.get("confirmed"), default=False)
+        lock_provider = self._clean_runtime_id(lock.get("provider"), max_len=80)
+        lock_model = self._clean_runtime_id(lock.get("model"))
+        actual_provider = self._clean_runtime_id(
+            gateway_runtime.get("provider") or gateway_runtime.get("effective_provider"),
+            max_len=80,
+        )
+        actual_model = self._clean_runtime_id(
+            gateway_runtime.get("model") or gateway_runtime.get("effective_model")
+        )
+
+        provider = (
+            actual_provider
+            or lock_provider
+            or (route.get("provider") if route else None)
+            or prefixed_provider
+            or None
+        )
+        model = (
+            actual_model
+            or (route.get("model") if route else None)
+            or lock_model
+            or split_model
+            or persisted_model
+            or self._clean_runtime_id(self._model_name)
+            or None
+        )
+
+        model_options = lock.get("model_options")
+        reasoning_config = config.get("reasoning_config")
+        if not isinstance(reasoning_config, dict):
+            reasoning_config = None
+        if not reasoning_config and isinstance(model_options, dict):
+            reasoning_config = _request_reasoning_config(model_options)
+        if not reasoning_config and isinstance(gateway_runtime.get("reasoning_config"), dict):
+            reasoning_config = gateway_runtime.get("reasoning_config")
+
+        reasoning: Optional[str] = None
+        if isinstance(reasoning_config, dict):
+            if reasoning_config.get("enabled") is False:
+                reasoning = "none"
+            else:
+                candidate = self._clean_runtime_id(
+                    reasoning_config.get("effort"), max_len=32
+                )
+                if candidate in _REASONING_EFFORTS:
+                    reasoning = candidate
+
+        if config.get("_runtime_inherited_from"):
+            route_source = "parent_session"
+            runtime_state = "inherited"
+        elif locked:
+            route_source = "session_model_lock"
+            runtime_state = "override"
+        elif gateway_runtime:
+            route_source = "gateway_runtime"
+            runtime_state = "effective"
+        elif session.get("parent_session_id"):
+            route_source = "parent_session"
+            runtime_state = "inherited"
+        elif route:
+            route_source = "model_routes"
+            runtime_state = "override"
+        elif persisted_model:
+            route_source = "session_model"
+            runtime_state = "override"
+        else:
+            route_source = "global"
+            runtime_state = "default"
+
+        requested_provider = lock_provider or (prefixed_provider or None)
+        requested_model = lock_model or (split_model or persisted_model or None)
+        requested = None
+        if requested_provider or requested_model:
+            requested = {
+                "provider": requested_provider,
+                "model": requested_model,
+            }
+
+        runtime: Dict[str, Any] = {
+            "provider": provider,
+            "model": model,
+            "route_source": route_source,
+            "source": route_source,
+            "reasoning": reasoning,
+            "state": runtime_state,
+            "inherited": runtime_state == "inherited",
+            "override": runtime_state == "override",
+        }
+        if requested is not None:
+            runtime["requested"] = requested
+        if locked:
+            runtime["model_lock"] = "accepted"
+        return runtime
+
     @staticmethod
-    def _session_response(session: Dict[str, Any]) -> Dict[str, Any]:
+    def _session_response(
+        session: Dict[str, Any],
+        *,
+        runtime: Optional[Dict[str, Any]] = None,
+        relationship_type: Optional[str] = None,
+    ) -> Dict[str, Any]:
         """Return a stable, client-safe session representation."""
         safe_keys = (
             "id", "source", "user_id", "model", "title", "started_at", "ended_at",
@@ -3288,6 +3414,9 @@ class APIServerAdapter(BasePlatformAdapter):
         # callers only need to know whether those snapshots exist.
         payload["has_system_prompt"] = bool(session.get("system_prompt"))
         payload["has_model_config"] = bool(session.get("model_config"))
+        payload["relationship_type"] = relationship_type
+        if runtime is not None:
+            payload["runtime"] = runtime
         return payload
 
     @staticmethod
@@ -3355,12 +3484,28 @@ class APIServerAdapter(BasePlatformAdapter):
             # aged past the recency window is back-filled rather than dropped.
             include_pinned=True,
         )
+        relationship_types = await asyncio.to_thread(
+            db.get_session_relationship_types,
+            [
+                session.get("_lineage_root_id") or session.get("id")
+                for session in sessions
+            ],
+        )
         # Back-filled pins arrive PAST the limit, so counting them would report
         # another page that doesn't exist. Only the recency window decides.
         windowed = sum(1 for s in sessions if not s.get("pinned"))
         return web.json_response({
             "object": "list",
-            "data": [self._session_response(s) for s in sessions],
+            "data": [
+                self._session_response(
+                    s,
+                    runtime=self._session_runtime_response(s),
+                    relationship_type=relationship_types.get(
+                        s.get("_lineage_root_id") or s.get("id")
+                    ),
+                )
+                for s in sessions
+            ],
             "limit": limit,
             "offset": offset,
             "has_more": windowed >= limit,
@@ -3475,7 +3620,17 @@ class APIServerAdapter(BasePlatformAdapter):
             return web.json_response(_openai_error(f"Session already exists: {session_id}", code="session_exists"), status=409)
         if err and err.startswith("title:"):
             return web.json_response(_openai_error(err[len("title:"):], code="invalid_title"), status=400)
-        return web.json_response({"object": "hermes.session", "session": self._session_response(session)}, status=201)
+        relationship_types = await asyncio.to_thread(
+            db.get_session_relationship_types, [session.get("id")]
+        )
+        return web.json_response({
+            "object": "hermes.session",
+            "session": self._session_response(
+                session,
+                runtime=self._session_runtime_response(session),
+                relationship_type=relationship_types.get(session.get("id")),
+            ),
+        }, status=201)
 
     async def _handle_get_session(self, request: "web.Request") -> "web.Response":
         """GET /api/sessions/{session_id}."""
@@ -3485,7 +3640,18 @@ class APIServerAdapter(BasePlatformAdapter):
         session, err = await self._get_existing_session_or_404(request.match_info["session_id"])
         if err:
             return err
-        return web.json_response({"object": "hermes.session", "session": self._session_response(session)})
+        db = await self._ensure_session_db_async()
+        relationship_types = await asyncio.to_thread(
+            db.get_session_relationship_types, [session.get("id")]
+        )
+        return web.json_response({
+            "object": "hermes.session",
+            "session": self._session_response(
+                session,
+                runtime=self._session_runtime_response(session),
+                relationship_type=relationship_types.get(session.get("id")),
+            ),
+        })
 
     async def _handle_patch_session(self, request: "web.Request") -> "web.Response":
         """PATCH /api/sessions/{session_id} — update client-safe session metadata."""
@@ -3525,7 +3691,17 @@ class APIServerAdapter(BasePlatformAdapter):
         if body.get("end_reason"):
             await asyncio.to_thread(db.end_session, session_id, str(body["end_reason"]))
         session = await asyncio.to_thread(db.get_session, session_id) or session
-        return web.json_response({"object": "hermes.session", "session": self._session_response(session)})
+        relationship_types = await asyncio.to_thread(
+            db.get_session_relationship_types, [session.get("id")]
+        )
+        return web.json_response({
+            "object": "hermes.session",
+            "session": self._session_response(
+                session,
+                runtime=self._session_runtime_response(session),
+                relationship_type=relationship_types.get(session.get("id")),
+            ),
+        })
 
     async def _handle_delete_session(self, request: "web.Request") -> "web.Response":
         """DELETE /api/sessions/{session_id}."""
@@ -3600,51 +3776,147 @@ class APIServerAdapter(BasePlatformAdapter):
         })
 
     async def _handle_fork_session(self, request: "web.Request") -> "web.Response":
-        """POST /api/sessions/{session_id}/fork — branch via current SessionDB primitives."""
+        """POST /api/sessions/{session_id}/fork.
+
+        The optional ``through_message_id`` is an inclusive source-message
+        cutoff.  SessionDB performs validation, tool-group boundary extension,
+        and child creation in one transaction so the parent is never ended or
+        mutated and failed forks leave no child row behind.
+        """
         auth_err = self._check_auth(request)
         if auth_err:
             return auth_err
         source_id = request.match_info["session_id"]
-        source, err = await self._get_existing_session_or_404(source_id)
+        _source, err = await self._get_existing_session_or_404(source_id)
         if err:
             return err
-        body, err = await self._read_json_body(request)
-        if err:
-            return err
-        db = await self._ensure_session_db_async()
-        fork_id = str(body.get("id") or body.get("session_id") or f"api_{int(time.time())}_{uuid.uuid4().hex[:8]}").strip()
-        if not fork_id or re.search(r'[\r\n\x00]', fork_id):
-            return web.json_response(_openai_error("Invalid session ID", code="invalid_session_id"), status=400)
-        if await asyncio.to_thread(db.get_session, fork_id):
-            return web.json_response(_openai_error(f"Session already exists: {fork_id}", code="session_exists"), status=409)
+        if request.content_length == 0:
+            body = {}
+            err = None
+        else:
+            body, err = await self._read_json_body(request)
+            if err:
+                return err
 
-        # Match the CLI /branch semantics: mark the original as branched, then
-        # create a child session that carries the transcript forward. This uses
-        # SessionDB's native parent_session_id/end_reason visibility model rather
-        # than inventing a parallel fork store.
-        await asyncio.to_thread(db.end_session, source_id, "branched")
-        await asyncio.to_thread(db.create_session,
-            fork_id,
-            "api_server",
-            model=source.get("model"),
-            system_prompt=source.get("system_prompt"),
-            parent_session_id=source_id,
+        raw_through = body.get("through_message_id")
+        if raw_through is None and "throughMessageId" in body:
+            # Accept the browser-facing spelling as a harmless compatibility
+            # aid; the official Agent contract remains snake_case.
+            raw_through = body.get("throughMessageId")
+        through_message_id: Optional[int] = None
+        if raw_through is not None:
+            if isinstance(raw_through, bool):
+                return web.json_response(
+                    _openai_error(
+                        "through_message_id must be a positive integer",
+                        code="invalid_through_message_id",
+                    ),
+                    status=400,
+                )
+            if isinstance(raw_through, int):
+                through_message_id = raw_through
+            elif isinstance(raw_through, str) and re.fullmatch(
+                r"\+?[0-9]+", raw_through.strip()
+            ):
+                through_message_id = int(raw_through.strip())
+            else:
+                return web.json_response(
+                    _openai_error(
+                        "through_message_id must be a positive integer",
+                        code="invalid_through_message_id",
+                    ),
+                    status=400,
+                )
+            if through_message_id <= 0:
+                return web.json_response(
+                    _openai_error(
+                        "through_message_id must be a positive integer",
+                        code="invalid_through_message_id",
+                    ),
+                    status=400,
+                )
+
+        db = await self._ensure_session_db_async()
+        if db is None:
+            return web.json_response(
+                _openai_error(
+                    "Session database unavailable",
+                    code="session_db_unavailable",
+                ),
+                status=503,
+            )
+
+        raw_id = body.get("id") or body.get("session_id")
+        generated_id = not raw_id
+        fork_id = (
+            str(raw_id).strip()
+            if raw_id
+            else f"api_fork_{int(time.time())}_{uuid.uuid4().hex}"
         )
-        messages = await asyncio.to_thread(db.get_messages, source_id)
-        await asyncio.to_thread(db.replace_messages, fork_id, messages)
+        from gateway.session import _is_path_unsafe
+        if (
+            not fork_id
+            or re.search(r"[\r\n\x00]", fork_id)
+            or _is_path_unsafe(fork_id)
+            or len(fork_id) > self._MAX_SESSION_HEADER_LEN
+        ):
+            return web.json_response(
+                _openai_error("Invalid session ID", code="invalid_session_id"),
+                status=400,
+            )
+
         title = body.get("title")
-        if title is None:
-            base = source.get("title") or "fork"
+        # A generated id collision is extraordinarily unlikely, but retrying
+        # here keeps the uniqueness guarantee deterministic under a patched
+        # UUID/time source and avoids exposing an implementation race.
+        fork = None
+        for attempt in range(4):
             try:
-                title = await asyncio.to_thread(db.get_next_title_in_lineage, base)
+                from hermes_state import SessionForkError
+
+                fork = await asyncio.to_thread(
+                    db.fork_session,
+                    source_id,
+                    fork_id,
+                    source="api_server",
+                    title=title,
+                    through_message_id=through_message_id,
+                )
+                break
+            except SessionForkError as exc:
+                if generated_id and exc.code == "session_exists" and attempt < 3:
+                    fork_id = f"api_fork_{int(time.time())}_{uuid.uuid4().hex}"
+                    continue
+                return web.json_response(
+                    _openai_error(str(exc), code=exc.code),
+                    status=exc.status,
+                )
             except Exception:
-                title = f"{base} fork"
-        try:
-            await asyncio.to_thread(db.set_session_title, fork_id, str(title))
-        except ValueError as exc:
-            return web.json_response(_openai_error(str(exc), code="invalid_title"), status=400)
-        fork = await asyncio.to_thread(db.get_session, fork_id) or {"id": fork_id, "parent_session_id": source_id}
-        return web.json_response({"object": "hermes.session", "session": self._session_response(fork)}, status=201)
+                logger.exception("POST /api/sessions/%s/fork failed", source_id)
+                return web.json_response(
+                    _openai_error("Failed to fork session", code="session_fork_failed"),
+                    status=500,
+                )
+
+        if fork is None:
+            return web.json_response(
+                _openai_error("Failed to fork session", code="session_fork_failed"),
+                status=500,
+            )
+        relationship_types = await asyncio.to_thread(
+            db.get_session_relationship_types, [fork.get("id")]
+        )
+        return web.json_response(
+            {
+                "object": "hermes.session",
+                "session": self._session_response(
+                    fork,
+                    runtime=self._session_runtime_response(fork),
+                    relationship_type=relationship_types.get(fork.get("id")),
+                ),
+            },
+            status=201,
+        )
 
     @_admit_api_agent_request
     async def _handle_session_chat(self, request: "web.Request") -> "web.Response":

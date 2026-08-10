@@ -1,5 +1,6 @@
 """Focused tests for API server session-control endpoints."""
 
+import json
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -64,6 +65,8 @@ async def test_capabilities_advertises_session_control_surface(adapter):
     assert features["session_chat"] is True
     assert features["session_chat_streaming"] is True
     assert features["session_fork"] is True
+    assert features["session_fork_through_message_id"] is True
+    assert features["session_relationship_type"] is True
     assert features["admin_config_rw"] is False
     assert features["memory_write_api"] is False
     assert features["skills_api"] is True
@@ -695,3 +698,262 @@ async def test_patch_session_still_rejects_unknown_fields(adapter, session_db):
         resp = await cli.patch(f"/api/sessions/{session_id}", json={"nonsense": 1})
         assert resp.status == 400, await resp.text()
         assert (await resp.json())["error"]["code"] == "unsupported_session_field"
+
+
+@pytest.mark.asyncio
+async def test_fork_endpoint_full_copy_keeps_parent_immutable_and_inherits_runtime(
+    adapter, session_db
+):
+    session_id = session_db.create_session(
+        "fork-parent",
+        source="api_server",
+        model="anthropic/claude-sonnet",
+        system_prompt="system prompt",
+        model_config={
+            "browser_model_lock": {
+                "provider": "openrouter",
+                "model": "anthropic/claude-sonnet",
+                "model_options": {"reasoning_effort": "high"},
+                "route_source": "raw_request",
+                "confirmed": True,
+            },
+            "reasoning_config": {"enabled": True, "effort": "high"},
+            "_delegate_from": "old-parent",
+        },
+    )
+    session_db.append_message(session_id, role="user", content="question")
+    session_db.append_message(session_id, role="assistant", content="answer")
+    parent_before = session_db.get_session(session_id)
+    messages_before = session_db.get_messages(session_id)
+
+    app = _create_session_app(adapter)
+    async with TestClient(TestServer(app)) as cli:
+        response = await cli.post(
+            f"/api/sessions/{session_id}/fork",
+            json={"id": "fork-child", "title": "alternate"},
+        )
+        assert response.status == 201, await response.text()
+        payload = await response.json()
+
+    child = payload["session"]
+    assert child["id"] == "fork-child"
+    assert child["parent_session_id"] == session_id
+    assert child["relationship_type"] == "fork"
+    assert child["runtime"]["provider"] == "openrouter"
+    assert child["runtime"]["model"] == "anthropic/claude-sonnet"
+    assert child["runtime"]["reasoning"] == "high"
+    assert child["runtime"]["state"] == "inherited"
+    assert child["runtime"]["inherited"] is True
+    assert child["runtime"]["override"] is False
+    assert "model_config" not in child
+    assert "api_key" not in json.dumps(child)
+
+    parent_after = session_db.get_session(session_id)
+    assert parent_after["ended_at"] == parent_before["ended_at"]
+    assert parent_after["end_reason"] == parent_before["end_reason"]
+    assert parent_after["model_config"] == parent_before["model_config"]
+    assert session_db.get_messages(session_id) == messages_before
+
+    child_config = json.loads(session_db.get_session("fork-child")["model_config"])
+    assert child_config["_branched_from"] == session_id
+    assert "_delegate_from" not in child_config
+
+    session_db.update_session_runtime_lock(
+        "fork-child",
+        provider="anthropic",
+        model="claude-sonnet",
+        model_options={"reasoning_effort": "low"},
+        route_source="raw_request",
+        confirmed=True,
+    )
+    async with TestClient(TestServer(app)) as cli:
+        refreshed = await cli.get("/api/sessions/fork-child")
+        assert refreshed.status == 200
+        refreshed_runtime = (await refreshed.json())["session"]["runtime"]
+    assert refreshed_runtime["state"] == "override"
+    assert refreshed_runtime["source"] == "session_model_lock"
+    assert refreshed_runtime["override"] is True
+
+
+@pytest.mark.asyncio
+async def test_fork_endpoint_cutoff_is_inclusive_and_extends_tool_group(
+    adapter, session_db
+):
+    session_id = session_db.create_session("cutoff-parent", source="api_server")
+    session_db.append_message(session_id, role="user", content="question")
+    call_id = session_db.append_message(
+        session_id,
+        role="assistant",
+        content="checking",
+        tool_calls=[
+            {
+                "id": "call_1",
+                "type": "function",
+                "function": {"name": "search", "arguments": "{}"},
+            }
+        ],
+        finish_reason="tool_calls",
+    )
+    session_db.append_message(
+        session_id,
+        role="tool",
+        content="result",
+        tool_call_id="call_1",
+        tool_name="search",
+    )
+    session_db.append_message(session_id, role="assistant", content="final")
+    session_db.append_message(session_id, role="user", content="later")
+
+    app = _create_session_app(adapter)
+    async with TestClient(TestServer(app)) as cli:
+        response = await cli.post(
+            f"/api/sessions/{session_id}/fork",
+            json={
+                "id": "cutoff-child",
+                "through_message_id": call_id,
+            },
+        )
+        assert response.status == 201, await response.text()
+        child = (await response.json())["session"]
+        messages_response = await cli.get(
+            "/api/sessions/cutoff-child/messages?order=oldest"
+        )
+        assert messages_response.status == 200
+        child_messages = (await messages_response.json())["data"]
+
+    assert child["relationship_type"] == "fork"
+    assert [message["content"] for message in child_messages] == [
+        "question",
+        "checking",
+        "result",
+    ]
+    assert session_db.get_session(session_id)["end_reason"] is None
+
+
+@pytest.mark.asyncio
+async def test_fork_endpoint_rejects_invalid_foreign_inactive_and_unsettled_cutoffs(
+    adapter, session_db
+):
+    session_db.create_session("invalid-parent", source="api_server")
+    session_db.create_session("foreign-parent", source="api_server")
+    foreign_id = session_db.append_message(
+        "foreign-parent", role="user", content="foreign"
+    )
+    session_db.create_session("inactive-parent", source="api_server")
+    inactive_id = session_db.append_message(
+        "inactive-parent", role="user", content="rewind"
+    )
+    session_db.rewind_to_message("inactive-parent", inactive_id)
+    session_db.create_session("unsettled-parent", source="api_server")
+    session_db.append_message(
+        "unsettled-parent",
+        role="assistant",
+        content="pending",
+        tool_calls=[
+            {
+                "id": "call_pending",
+                "type": "function",
+                "function": {"name": "search", "arguments": "{}"},
+            }
+        ],
+        finish_reason="tool_calls",
+    )
+
+    app = _create_session_app(adapter)
+    async with TestClient(TestServer(app)) as cli:
+        invalid = await cli.post(
+            "/api/sessions/invalid-parent/fork",
+            json={"id": "invalid-child", "through_message_id": 0},
+        )
+        assert invalid.status == 400
+        assert (await invalid.json())["error"]["code"] == "invalid_through_message_id"
+
+        foreign = await cli.post(
+            "/api/sessions/invalid-parent/fork",
+            json={"id": "foreign-child", "through_message_id": foreign_id},
+        )
+        assert foreign.status == 400
+        assert (await foreign.json())["error"]["code"] == "message_not_in_session"
+
+        inactive = await cli.post(
+            "/api/sessions/inactive-parent/fork",
+            json={"id": "inactive-child", "through_message_id": inactive_id},
+        )
+        assert inactive.status == 409
+        assert (await inactive.json())["error"]["code"] == "source_message_inactive"
+
+        unsettled = await cli.post(
+            "/api/sessions/unsettled-parent/fork",
+            json={"id": "unsettled-child"},
+        )
+        assert unsettled.status == 409
+        assert (await unsettled.json())["error"]["code"] == "fork_unsettled"
+
+    assert session_db.get_session("invalid-child") is None
+    assert session_db.get_session("foreign-child") is None
+    assert session_db.get_session("inactive-child") is None
+    assert session_db.get_session("unsettled-child") is None
+    assert session_db.get_session("invalid-parent")["end_reason"] is None
+    assert session_db.get_session("unsettled-parent")["end_reason"] is None
+
+
+@pytest.mark.asyncio
+async def test_session_list_and_detail_advertise_relationship_types(adapter, session_db):
+    session_db.create_session("relationship-root", source="api_server")
+    session_db.fork_session("relationship-root", "relationship-fork")
+    session_db.create_session(
+        "relationship-subagent",
+        source="tool",
+        parent_session_id="relationship-root",
+        model_config={"_delegate_from": "relationship-root"},
+    )
+    session_db.create_session("relationship-compression", source="api_server")
+    session_db.end_session("relationship-compression", "compression")
+    session_db.create_session(
+        "relationship-continuation",
+        source="api_server",
+        parent_session_id="relationship-compression",
+    )
+
+    app = _create_session_app(adapter)
+    async with TestClient(TestServer(app)) as cli:
+        response = await cli.get(
+            "/api/sessions?include_children=true&limit=100"
+        )
+        assert response.status == 200
+        rows = (await response.json())["data"]
+        detail_response = await cli.get("/api/sessions/relationship-root")
+        assert detail_response.status == 200
+        detail = (await detail_response.json())["session"]
+
+    by_id = {row["id"]: row for row in rows}
+    assert by_id["relationship-root"]["relationship_type"] == "root"
+    assert by_id["relationship-fork"]["relationship_type"] == "fork"
+    assert by_id["relationship-subagent"]["relationship_type"] == "subagent"
+    assert (
+        by_id["relationship-continuation"]["relationship_type"]
+        == "compression_continuation"
+    )
+    assert detail["relationship_type"] == "root"
+    assert detail["runtime"]["state"] == "default"
+
+
+@pytest.mark.asyncio
+async def test_fork_endpoint_empty_body_is_backward_compatible_full_fork(
+    adapter, session_db
+):
+    session_id = session_db.create_session("empty-body-parent", source="api_server")
+    session_db.append_message(session_id, role="user", content="hello")
+
+    app = _create_session_app(adapter)
+    async with TestClient(TestServer(app)) as cli:
+        response = await cli.post(f"/api/sessions/{session_id}/fork")
+        assert response.status == 201, await response.text()
+        child = (await response.json())["session"]
+
+    assert child["id"] != session_id
+    assert child["parent_session_id"] == session_id
+    assert child["relationship_type"] == "fork"
+    assert [message["content"] for message in session_db.get_messages(child["id"])] == [
+        "hello"
+    ]

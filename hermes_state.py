@@ -245,6 +245,179 @@ def _delegate_from_json(col: str = "model_config") -> str:
     return f"json_extract(COALESCE({col}, '{{}}'), '$._delegate_from')"
 
 
+def _session_model_config_dict(raw: Any) -> Dict[str, Any]:
+    """Decode a session model-config blob without allowing bad rows to leak."""
+    if isinstance(raw, dict):
+        return dict(raw)
+    if isinstance(raw, str) and raw.strip():
+        try:
+            value = json.loads(raw)
+        except (TypeError, ValueError):
+            return {}
+        if isinstance(value, dict):
+            return value
+    return {}
+
+
+def _fork_tool_call_ids(message: Dict[str, Any]) -> List[str]:
+    """Return the provider call ids declared by one assistant message."""
+    raw_calls = message.get("tool_calls")
+    if isinstance(raw_calls, str):
+        try:
+            raw_calls = json.loads(raw_calls)
+        except (TypeError, ValueError):
+            raw_calls = None
+    if isinstance(raw_calls, dict):
+        raw_calls = [raw_calls]
+    if not isinstance(raw_calls, list):
+        return []
+
+    ids: List[str] = []
+    for call in raw_calls:
+        if not isinstance(call, dict):
+            continue
+        call_id = call.get("id") or call.get("call_id")
+        if not call_id and isinstance(call.get("function"), dict):
+            call_id = call["function"].get("id")
+        if isinstance(call_id, str) and call_id.strip():
+            ids.append(call_id.strip())
+    return ids
+
+
+def _fork_tool_call_count(message: Dict[str, Any]) -> int:
+    """Return the number of calls in an assistant tool-call payload.
+
+    Older transcript writers stored only ``name``/``arguments`` on the
+    assistant row while keeping the real ids on the following tool rows.  A
+    count-based fallback lets the fork validator preserve those groups
+    without inventing provider ids or rejecting otherwise valid history.
+    """
+    raw_calls = message.get("tool_calls")
+    if isinstance(raw_calls, str):
+        try:
+            raw_calls = json.loads(raw_calls)
+        except (TypeError, ValueError):
+            return 0
+    if isinstance(raw_calls, dict):
+        return 1
+    return len(raw_calls) if isinstance(raw_calls, list) else 0
+
+
+def _settled_fork_prefix(
+    messages: List[Dict[str, Any]],
+    through_message_id: Optional[int],
+) -> List[Dict[str, Any]]:
+    """Select a settled inclusive prefix without splitting tool activity.
+
+    A tool-call assistant row and its contiguous tool-result rows form one
+    durable activity group.  If a cutoff lands in that group, the cutoff is
+    extended through all matching results.  A missing result, an interleaved
+    non-tool row, an inactive row, or an orphan result is unsafe to replay and
+    is rejected before a child session is inserted.
+    """
+    active_messages = [m for m in messages if bool(m.get("active", 1))]
+    by_id = {m.get("id"): m for m in messages}
+
+    if through_message_id is None:
+        end_index = len(active_messages) - 1
+    else:
+        target = by_id.get(through_message_id)
+        if target is None:
+            raise SessionForkError(
+                "source_message_not_found",
+                f"Source message {through_message_id} was not found",
+                status=404,
+            )
+        if not bool(target.get("active", 1)):
+            raise SessionForkError(
+                "source_message_inactive",
+                f"Source message {through_message_id} is inactive and cannot be forked",
+                status=409,
+            )
+        try:
+            end_index = next(
+                index
+                for index, message in enumerate(active_messages)
+                if message.get("id") == through_message_id
+            )
+        except StopIteration:
+            raise SessionForkError(
+                "source_message_not_found",
+                f"Source message {through_message_id} was not found",
+                status=404,
+            )
+
+    if end_index < 0:
+        return []
+
+    # Walk every complete group that is in (or touches) the candidate prefix.
+    # The scan also validates the full history for full forks, so a child can
+    # never start with an assistant tool call that has no durable result.
+    final_end = end_index
+    declared_calls: Dict[str, int] = {}
+    index = 0
+    while index < len(active_messages):
+        message = active_messages[index]
+        role = str(message.get("role") or "").lower()
+        call_ids = _fork_tool_call_ids(message) if role == "assistant" else []
+        call_count = _fork_tool_call_count(message) if role == "assistant" else 0
+        if call_count:
+            if len(set(call_ids)) != len(call_ids):
+                raise SessionForkError(
+                    "fork_unsettled",
+                    f"Assistant tool-call group at message {message.get('id')} has duplicate call ids",
+                )
+            expected = set(call_ids)
+            result_ids: List[str] = []
+            result_index = index + 1
+            while result_index < len(active_messages):
+                result = active_messages[result_index]
+                if str(result.get("role") or "").lower() not in {"tool", "function"}:
+                    break
+                result_call_id = result.get("tool_call_id")
+                if not isinstance(result_call_id, str) or not result_call_id.strip():
+                    break
+                result_call_id = result_call_id.strip()
+                if result_call_id in result_ids:
+                    break
+                result_ids.append(result_call_id)
+                if len(result_ids) >= call_count:
+                    result_index += 1
+                    break
+                result_index += 1
+
+            if len(result_ids) != call_count or not expected.issubset(set(result_ids)):
+                # Groups wholly after a point-in-time cutoff are irrelevant;
+                # otherwise an incomplete group would be copied or the full
+                # fork would replay an unsettled transcript.
+                if index <= final_end:
+                    raise SessionForkError(
+                        "fork_unsettled",
+                        f"Tool-call group at message {message.get('id')} is incomplete or unsettled",
+                    )
+            else:
+                group_end = result_index - 1
+                if index <= final_end < group_end:
+                    final_end = group_end
+                for call_id in result_ids:
+                    declared_calls[call_id] = index
+                index = group_end
+        index += 1
+
+    prefix = active_messages[: final_end + 1]
+    for message in prefix:
+        if str(message.get("role") or "").lower() not in {"tool", "function"}:
+            continue
+        call_id = message.get("tool_call_id")
+        if not isinstance(call_id, str) or call_id.strip() not in declared_calls:
+            raise SessionForkError(
+                "fork_unsettled",
+                f"Tool result at message {message.get('id')} has no matching assistant call",
+            )
+
+    return prefix
+
+
 # Sentinel returned by SessionDB._merge_model_config_json when the session row
 # doesn't exist and on_missing="skip" — distinguishes "no row" from the legal
 # None result ("merged config is empty → store NULL").
@@ -2011,6 +2184,20 @@ class CompressionSessionBusyError(RuntimeError):
     """A non-owner tried to write while compression owns the session."""
 
 
+class SessionForkError(RuntimeError):
+    """A requested session fork cannot be created safely.
+
+    The API server maps these structured failures to stable HTTP errors.  The
+    exception is raised inside the fork transaction, so validation failures
+    roll back any work and never leave a partially-created child row behind.
+    """
+
+    def __init__(self, code: str, message: str, *, status: int = 409):
+        self.code = code
+        self.status = status
+        super().__init__(message)
+
+
 class SessionCompressionInProgressError(CompressionSessionBusyError):
     """A concurrent writer collided with a *live* compression lock.
 
@@ -3674,6 +3861,270 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         """Create a new session record. Returns the session_id."""
         self._insert_session_row(session_id, source, **kwargs)
         return session_id
+
+    def fork_session(
+        self,
+        source_session_id: str,
+        child_session_id: str,
+        *,
+        source: str = "api_server",
+        title: Optional[str] = None,
+        through_message_id: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Atomically create a full or point-in-time child session.
+
+        The source row and its transcript are read inside the same write
+        transaction that inserts the child.  Validation therefore happens
+        before the child exists, and a failed cutoff/tool-integrity check
+        cannot leave an empty or partially-seeded session behind.  The source
+        session is intentionally never ended or otherwise updated.
+
+        ``through_message_id`` is an inclusive source-message id.  A tool-call
+        group is extended through its contiguous results when the cutoff lands
+        inside it; incomplete groups are rejected with :class:`SessionForkError`.
+        """
+        if through_message_id is not None:
+            if isinstance(through_message_id, bool) or not isinstance(
+                through_message_id, int
+            ) or through_message_id <= 0:
+                raise SessionForkError(
+                    "invalid_through_message_id",
+                    "through_message_id must be a positive source message id",
+                    status=400,
+                )
+
+        def _next_lineage_title(conn, base_title: str) -> str:
+            match = re.match(r"^(.*?) #(\d+)$", base_title)
+            base = match.group(1) if match else base_title
+            escaped = _escape_like(base)
+            rows = conn.execute(
+                "SELECT title FROM sessions "
+                "WHERE title = ? OR title LIKE ? ESCAPE '\\'",
+                (base, f"{escaped} #%"),
+            ).fetchall()
+            if not rows:
+                return base
+            max_num = 1
+            for row in rows:
+                existing = row["title"]
+                number_match = re.match(r"^.* #(\d+)$", existing or "")
+                if number_match:
+                    max_num = max(max_num, int(number_match.group(1)))
+            return f"{base} #{max_num + 1}"
+
+        def _hydrate_message(row: sqlite3.Row) -> Dict[str, Any]:
+            message = dict(row)
+            if "content" in message:
+                message["content"] = self._decode_content(message["content"])
+            if message.get("tool_calls"):
+                try:
+                    message["tool_calls"] = json.loads(message["tool_calls"])
+                except (json.JSONDecodeError, TypeError):
+                    message["tool_calls"] = []
+            if message.get("display_metadata") is not None:
+                message["display_metadata"] = self._decode_display_metadata(
+                    message["display_metadata"]
+                )
+            return message
+
+        def _do(conn):
+            child_exists = conn.execute(
+                "SELECT 1 FROM sessions WHERE id = ? LIMIT 1",
+                (child_session_id,),
+            ).fetchone()
+            if child_exists:
+                raise SessionForkError(
+                    "session_exists",
+                    f"Session already exists: {child_session_id}",
+                    status=409,
+                )
+
+            source_row = conn.execute(
+                "SELECT s.*, COALESCE(sp.prompt, s.system_prompt) "
+                "AS _system_prompt_resolved "
+                "FROM sessions s LEFT JOIN system_prompts sp "
+                "ON sp.hash = s.system_prompt_hash WHERE s.id = ?",
+                (source_session_id,),
+            ).fetchone()
+            if source_row is None:
+                raise SessionForkError(
+                    "session_not_found",
+                    f"Session not found: {source_session_id}",
+                    status=404,
+                )
+            source_session = self._session_row_dict(source_row)
+
+            all_rows = conn.execute(
+                "SELECT * FROM messages WHERE session_id = ? ORDER BY id ASC",
+                (source_session_id,),
+            ).fetchall()
+            all_messages = [_hydrate_message(row) for row in all_rows]
+
+            if through_message_id is not None:
+                target = conn.execute(
+                    "SELECT session_id, active FROM messages WHERE id = ?",
+                    (through_message_id,),
+                ).fetchone()
+                if target is not None and target["session_id"] != source_session_id:
+                    raise SessionForkError(
+                        "message_not_in_session",
+                        f"Message {through_message_id} does not belong to session {source_session_id}",
+                        status=400,
+                    )
+
+            prefix = _settled_fork_prefix(all_messages, through_message_id)
+
+            config = _session_model_config_dict(source_session.get("model_config"))
+            # A branch is a user-visible child, not a delegated worker.  Do
+            # not let a copied delegate marker hide it from session pickers.
+            config.pop("_delegate_from", None)
+            config["_branched_from"] = source_session_id
+            config["_runtime_inherited_from"] = source_session_id
+            model_config = json.dumps(config) if config else None
+
+            if title is None:
+                base_title = source_session.get("title") or "fork"
+                child_title = _next_lineage_title(
+                    conn, self.sanitize_title(str(base_title)) or "fork"
+                )
+                try:
+                    child_title = self.sanitize_title(child_title)
+                except ValueError as exc:
+                    raise SessionForkError(
+                        "invalid_title", str(exc), status=400
+                    ) from exc
+                title_source = self.TITLE_SOURCE_DERIVED
+            else:
+                try:
+                    child_title = self.sanitize_title(str(title))
+                except ValueError as exc:
+                    raise SessionForkError(
+                        "invalid_title", str(exc), status=400
+                    ) from exc
+                title_source = self.TITLE_SOURCE_USER
+
+            if child_title:
+                conflict = conn.execute(
+                    "SELECT id FROM sessions WHERE title = ? AND id != ? LIMIT 1",
+                    (child_title, child_session_id),
+                ).fetchone()
+                if conflict:
+                    raise SessionForkError(
+                        "invalid_title",
+                        f"Title already in use by session {conflict['id']}",
+                        status=400,
+                    )
+
+            system_prompt = source_session.get("system_prompt")
+            system_prompt_hash = self._store_system_prompt(conn, system_prompt)
+            conn.execute(
+                """INSERT INTO sessions (
+                   id, source, model, model_config, system_prompt,
+                   system_prompt_hash, parent_session_id, cwd, git_branch,
+                   git_repo_root, profile_name, title, title_source, started_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    child_session_id,
+                    source,
+                    source_session.get("model"),
+                    model_config,
+                    None,
+                    system_prompt_hash,
+                    source_session_id,
+                    source_session.get("cwd"),
+                    source_session.get("git_branch"),
+                    source_session.get("git_repo_root"),
+                    source_session.get("profile_name"),
+                    child_title,
+                    title_source if child_title else None,
+                    time.time(),
+                ),
+            )
+
+            inserted, tool_calls_total = self._insert_message_rows(
+                conn, child_session_id, prefix
+            )
+            conn.execute(
+                "UPDATE sessions SET message_count = ?, tool_call_count = ? WHERE id = ?",
+                (inserted, tool_calls_total, child_session_id),
+            )
+            if system_prompt_hash is not None:
+                self._delete_unreferenced_system_prompts(conn)
+
+            child_row = conn.execute(
+                "SELECT s.*, COALESCE(sp.prompt, s.system_prompt) "
+                "AS _system_prompt_resolved FROM sessions s "
+                "LEFT JOIN system_prompts sp ON sp.hash = s.system_prompt_hash "
+                "WHERE s.id = ?",
+                (child_session_id,),
+            ).fetchone()
+            return self._session_row_dict(child_row)
+
+        return self._execute_write(
+            _do, patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S
+        )
+
+    def get_session_relationship_types(
+        self, session_ids: List[str]
+    ) -> Dict[str, Optional[str]]:
+        """Return durable relationship types for session ids in one query.
+
+        The parent join keeps list/detail callers from issuing one query per
+        row, including when a page contains a child whose parent is outside
+        that page.  Unknown generic parent edges remain ``None`` rather than
+        being guessed from titles or source display text.
+        """
+        ids = list(dict.fromkeys(session_id for session_id in session_ids if session_id))
+        if not ids:
+            return {}
+
+        results: Dict[str, Optional[str]] = {}
+        for start in range(0, len(ids), 900):
+            chunk = ids[start : start + 900]
+            placeholders = ",".join("?" for _ in chunk)
+            with self._read_ctx() as conn:
+                rows = conn.execute(
+                    f"""SELECT s.id, s.parent_session_id, s.started_at,
+                               s.source, s.model_config,
+                               p.end_reason AS parent_end_reason,
+                               p.ended_at AS parent_ended_at
+                        FROM sessions s
+                        LEFT JOIN sessions p ON p.id = s.parent_session_id
+                        WHERE s.id IN ({placeholders})""",
+                    chunk,
+                ).fetchall()
+            for row in rows:
+                config = _session_model_config_dict(row["model_config"])
+                parent_id = row["parent_session_id"]
+                branched_from = config.get("_branched_from")
+                delegate_from = config.get("_delegate_from")
+                # A continuation may inherit a marker belonging to an older
+                # ancestor. Parent compression state wins in that case, but
+                # a marker that points at this direct parent is authoritative
+                # even when the parent was later closed/reopened.
+                if (
+                    row["parent_end_reason"] == "compression"
+                    and branched_from != parent_id
+                    and delegate_from != parent_id
+                ):
+                    relationship = "compression_continuation"
+                elif branched_from:
+                    relationship = "fork"
+                elif delegate_from:
+                    relationship = "subagent"
+                elif parent_id is None:
+                    relationship = "root"
+                elif (
+                    row["parent_end_reason"] == "branched"
+                    and row["parent_ended_at"] is not None
+                    and row["started_at"] >= row["parent_ended_at"]
+                ):
+                    # Legacy branch rows predate the durable marker.
+                    relationship = "fork"
+                else:
+                    relationship = None
+                results[row["id"]] = relationship
+        return results
 
     def record_gateway_session_peer(
         self,
@@ -5479,7 +5930,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         def _do(conn):
             merged = self._merge_model_config_json(
-                conn, session_id, {"browser_model_lock": lock}
+                conn,
+                session_id,
+                {
+                    "browser_model_lock": lock,
+                    "_runtime_inherited_from": None,
+                },
             )
             if merged is _MODEL_CONFIG_ROW_MISSING:
                 return

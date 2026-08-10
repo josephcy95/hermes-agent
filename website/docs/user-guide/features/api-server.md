@@ -252,7 +252,10 @@ Returns a machine-readable description of the API server's stable surface for ex
     "run_submission": true,
     "run_status": true,
     "run_events_sse": true,
-    "run_stop": true
+    "run_stop": true,
+    "session_fork": true,
+    "session_fork_through_message_id": true,
+    "session_relationship_type": true
   }
 }
 ```
@@ -453,11 +456,37 @@ External UIs can manage Hermes sessions over REST without standing up the dashbo
 | `PATCH` | `/api/sessions/{id}` | Update title or `end_reason` |
 | `DELETE` | `/api/sessions/{id}` | Delete a session |
 | `GET` | `/api/sessions/{id}/messages` | Message history for a session |
-| `POST` | `/api/sessions/{id}/fork` | Branch the session via `SessionDB` lineage (matches CLI `/branch` semantics) |
+| `POST` | `/api/sessions/{id}/fork` | Full or point-in-time branch via durable `SessionDB` lineage |
 | `POST` | `/api/sessions/{id}/chat` | Run one synchronous agent turn |
 | `POST` | `/api/sessions/{id}/chat/stream` | SSE wrapper over a single turn — emits `assistant.delta`, `tool.started`, `tool.completed`, `run.completed` events |
 
 `/v1/capabilities` advertises the full surface via `session_*` feature flags and `endpoints.session_*` entries so external UIs can detect support and fall back safely. Inline images are supported in `chat` and `chat/stream` payloads (multimodal-aware path).
+
+#### Forking a session
+
+The fork request body is an object. With no `through_message_id`, Hermes copies
+the complete settled transcript. To create a point-in-time branch, provide the
+positive SQLite message id from the source session:
+
+```json
+{
+  "title": "explore an alternate path",
+  "through_message_id": 42
+}
+```
+
+The cutoff is inclusive. If it lands inside an assistant tool-call activity,
+the API extends the child prefix through the contiguous matching tool results
+so a call is never separated from its result. An incomplete or unsettled
+activity returns `409` and no child is created. Invalid, inactive, or foreign
+message ids are rejected before the parent or child is changed. Forking never
+ends or mutates the source session.
+
+Session responses and list rows include the safe fields `relationship_type` and
+`runtime`. `relationship_type` is one of `root`, `fork`, `subagent`,
+`compression_continuation`, or `null`. `runtime` contains only effective
+provider/model/reasoning and provenance (`source`, `state`, `inherited`, and
+`override`); credentials and the raw `model_config` are never returned.
 
 ```bash
 # fork a session and run one turn
