@@ -39,6 +39,29 @@ def test_execution_transitions_are_durable(monkeypatch, tmp_path):
     assert persisted == [completed]
 
 
+def test_execution_ledger_follows_active_profile_context(tmp_path):
+    """A multiplexed process keeps each profile's attempts in its own DB."""
+    import cron.executions as executions
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    homes = [tmp_path / "profile-a", tmp_path / "profile-b"]
+    for index, home in enumerate(homes):
+        token = set_hermes_home_override(home)
+        try:
+            executions.create_execution(f"job-{index}", source="builtin")
+        finally:
+            reset_hermes_home_override(token)
+
+    for index, home in enumerate(homes):
+        token = set_hermes_home_override(home)
+        try:
+            records = executions.list_executions()
+        finally:
+            reset_hermes_home_override(token)
+        assert [record["job_id"] for record in records] == [f"job-{index}"]
+        assert (home / "cron" / "executions.db").exists()
+
+
 def test_terminal_execution_cannot_be_rewritten(monkeypatch, tmp_path):
     executions = _point_ledger(monkeypatch, tmp_path)
     record = executions.create_execution("immutable", source="builtin")

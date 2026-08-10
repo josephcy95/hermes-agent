@@ -15,6 +15,7 @@ Exposes an HTTP server with endpoints:
 - POST /api/sessions/{session_id}/fork — full or point-in-time SessionDB fork
 - POST /api/sessions/{session_id}/steer — steer the active persisted-session run
 - POST /api/sessions/{session_id}/chat[/stream] — chat with a persisted session
+- GET/PATCH/POST /api/management/* — versioned profile management API
 - POST /v1/runs                    — start a run, returns run_id immediately (202)
 - GET  /v1/runs/{run_id}           — retrieve current run status
 - GET  /v1/runs/{run_id}/events    — SSE stream of structured lifecycle events
@@ -1095,7 +1096,7 @@ class ResponseStore:
 # ---------------------------------------------------------------------------
 
 _CORS_HEADERS = {
-    "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
+    "Access-Control-Allow-Methods": "GET, POST, PATCH, DELETE, OPTIONS",
     "Access-Control-Allow-Headers": "Authorization, Content-Type, Idempotency-Key",
 }
 
@@ -1206,6 +1207,161 @@ def _openai_error(message: str, err_type: str = "invalid_request_error", param: 
             "code": code,
         }
     }
+
+
+_MANAGEMENT_ERROR_CODES = frozenset({
+    "managementUnsupported",
+    "managementForbidden",
+    "managementNotFound",
+    "managementValidationFailed",
+    "managementConflict",
+    "managementResourceTooLarge",
+    "managementUnsafeResource",
+    "managementUpstreamUnavailable",
+})
+
+_MANAGEMENT_ERROR_MESSAGES = {
+    "managementUnsupported": "This management operation is not supported by this Hermes Agent.",
+    "managementForbidden": "This management operation is not permitted.",
+    "managementNotFound": "The requested management resource was not found.",
+    "managementValidationFailed": "The management request is invalid.",
+    "managementConflict": "The resource changed since it was loaded.",
+    "managementResourceTooLarge": "The management resource exceeds the allowed size.",
+    "managementUnsafeResource": "The requested resource is not safe to expose through the management API.",
+    "managementUpstreamUnavailable": "The management service is temporarily unavailable.",
+}
+
+_MANAGEMENT_SAFE_DETAIL_KEYS = frozenset({
+    "resource",
+    "resourceId",
+    "documentId",
+    "skillId",
+    "scheduleId",
+    "expectedRevision",
+    "currentRevision",
+    "currentUpdatedAt",
+    "backupRevision",
+    "field",
+    "limit",
+    "maxSize",
+    "allowedValues",
+    "jobSaved",
+    "schedulerRegistered",
+    "retryCreate",
+})
+
+
+class _ManagementOperationUnsupported(Exception):
+    """The running Hermes version does not implement a routed operation."""
+
+
+def _management_error(
+    code: str,
+    message: str = "",
+    *,
+    retryable: bool = False,
+    upstream_status: int | None = None,
+    details: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Return the normalized management error envelope.
+
+    Messages supplied by service modules are used only when they are plainly
+    display text.  Anything that resembles a path or a sensitive-value label
+    falls back to the protocol's generic message.  Details are an allowlist so
+    a filesystem exception can never smuggle a raw path into an API response.
+    """
+    if code not in _MANAGEMENT_ERROR_CODES:
+        code = "managementUpstreamUnavailable"
+    fallback = _MANAGEMENT_ERROR_MESSAGES[code]
+    cleaned = _redact_api_error_text(message or fallback, limit=500)
+    lowered = cleaned.lower()
+    if (
+        "/" in cleaned
+        or "\\" in cleaned
+        or "hermes_home" in lowered
+        or ".env" in lowered
+        or "secret" in lowered
+        or "token" in lowered
+        or "api key" in lowered
+    ):
+        cleaned = fallback
+
+    error: Dict[str, Any] = {
+        "code": code,
+        "message": cleaned or fallback,
+        "retryable": bool(retryable),
+    }
+    if isinstance(upstream_status, int):
+        error["upstreamStatus"] = upstream_status
+    safe_details: Dict[str, Any] = {}
+    if isinstance(details, dict):
+        for key, value in details.items():
+            if key not in _MANAGEMENT_SAFE_DETAIL_KEYS:
+                continue
+            if isinstance(value, str):
+                safe_details[key] = _redact_api_error_text(value, limit=256)
+            elif isinstance(value, (bool, int, float)) or value is None:
+                safe_details[key] = value
+            elif isinstance(value, list):
+                safe_details[key] = [
+                    _redact_api_error_text(item, limit=128)
+                    if isinstance(item, str)
+                    else item
+                    for item in value[:50]
+                    if isinstance(item, (str, bool, int, float)) or item is None
+                ]
+    if safe_details:
+        error["details"] = safe_details
+    return {"error": error}
+
+
+def _normalized_management_error_code(value: Any, status: int) -> str:
+    """Map service-local error names to the public protocol vocabulary."""
+    raw = str(value or "").strip()
+    if raw in _MANAGEMENT_ERROR_CODES:
+        return raw
+    lowered = raw.lower().replace("-", "_")
+    if status == 415 or any(
+        part in lowered
+        for part in (
+            "unsafe",
+            "traversal",
+            "symlink",
+            "resource_type",
+            "not_text",
+            "path_escape",
+        )
+    ):
+        return "managementUnsafeResource"
+    if status in {405, 501} or "unsupported" in lowered or "not_supported" in lowered:
+        return "managementUnsupported"
+    if "unreadable" in lowered or "unavailable" in lowered:
+        return "managementUpstreamUnavailable"
+    if status == 409 or any(part in lowered for part in ("conflict", "revision")):
+        return "managementConflict"
+    if status == 404 or "not_found" in lowered or "missing" in lowered:
+        return "managementNotFound"
+    if status == 403 or "forbidden" in lowered or "permission" in lowered:
+        return "managementForbidden"
+    if status == 413 or "too_large" in lowered or "size" in lowered:
+        return "managementResourceTooLarge"
+    if status in {400, 422, 428} or any(
+        part in lowered
+        for part in ("invalid", "validation", "required", "precondition", "malformed")
+    ):
+        return "managementValidationFailed"
+    return "managementUpstreamUnavailable"
+
+
+def _invoke_management_service(module_name: str, function_name: str, *args, **kwargs):
+    """Import and invoke a management service inside ``asyncio.to_thread``."""
+    from importlib import import_module
+
+    module = import_module(module_name)
+    function = getattr(module, function_name, None)
+    if not callable(function):
+        raise _ManagementOperationUnsupported(function_name)
+    return function(*args, **kwargs)
 
 
 _api_agent_request_reservation: ContextVar[Optional[dict[str, bool]]] = ContextVar(
@@ -2019,6 +2175,165 @@ class APIServerAdapter(BasePlatformAdapter):
             status=401,
         )
 
+    def _check_management_auth(
+        self, request: "web.Request"
+    ) -> Optional["web.Response"]:
+        """Apply the existing bearer policy with a management error envelope."""
+        auth_error = self._check_auth(request)
+        if auth_error is None:
+            return None
+        return web.json_response(
+            _management_error(
+                "managementForbidden",
+                "Authentication is required for Hermes management operations.",
+            ),
+            status=getattr(auth_error, "status", 401) or 401,
+        )
+
+    async def _read_management_payload(
+        self,
+        request: "web.Request",
+        *,
+        allow_empty: bool = False,
+    ) -> tuple[Optional[Dict[str, Any]], Optional["web.Response"]]:
+        """Read one JSON object without leaking parser or request internals."""
+        if not request.can_read_body:
+            if allow_empty:
+                return {}, None
+            return None, web.json_response(
+                _management_error(
+                    "managementValidationFailed",
+                    "A JSON request body is required.",
+                ),
+                status=400,
+            )
+        try:
+            payload = await request.json()
+        except web.HTTPRequestEntityTooLarge:
+            return None, web.json_response(
+                _management_error("managementResourceTooLarge"),
+                status=413,
+            )
+        except Exception:
+            return None, web.json_response(
+                _management_error(
+                    "managementValidationFailed",
+                    "The request body must be valid JSON.",
+                ),
+                status=400,
+            )
+        if not isinstance(payload, dict):
+            return None, web.json_response(
+                _management_error(
+                    "managementValidationFailed",
+                    "The request body must be a JSON object.",
+                ),
+                status=400,
+            )
+        return payload, None
+
+    def _management_exception_response(
+        self,
+        exc: Exception,
+        *,
+        context: Optional[Dict[str, Any]] = None,
+    ) -> "web.Response":
+        """Normalize service-local exceptions without exposing internals."""
+        if isinstance(
+            exc,
+            (_ManagementOperationUnsupported, ModuleNotFoundError, ImportError),
+        ):
+            return web.json_response(
+                _management_error("managementUnsupported"),
+                status=501,
+            )
+
+        raw_status = getattr(exc, "status_code", getattr(exc, "status", 500))
+        try:
+            status = int(raw_status)
+        except (TypeError, ValueError):
+            status = 500
+        if status < 400 or status > 599:
+            status = 500
+
+        raw_code = getattr(exc, "code", "")
+        code = _normalized_management_error_code(raw_code, status)
+        details = getattr(exc, "details", None)
+        merged_details: Dict[str, Any] = dict(details) if isinstance(details, dict) else {}
+        schedule_saved_without_registration = (
+            code == "managementUpstreamUnavailable"
+            and status == 424
+            and merged_details.get("jobSaved") is True
+            and merged_details.get("schedulerRegistered") is False
+            and merged_details.get("retryCreate") is False
+        )
+        if (
+            code == "managementUpstreamUnavailable"
+            and status < 500
+            and not schedule_saved_without_registration
+        ):
+            status = 503
+        for key, value in (context or {}).items():
+            if value is not None and key not in merged_details:
+                merged_details[key] = value
+        message = getattr(exc, "message", "") or str(exc)
+
+        if code == "managementUpstreamUnavailable":
+            logger.exception("Management API service failure")
+            # Unknown exceptions may contain arbitrary local details.  Never
+            # send their text to a remote management client.
+            message = (
+                "The schedule was saved, but external scheduler registration failed. "
+                "Do not retry creation; refresh schedules."
+                if schedule_saved_without_registration
+                else _MANAGEMENT_ERROR_MESSAGES[code]
+            )
+        return web.json_response(
+            _management_error(
+                code,
+                message,
+                retryable=code == "managementUpstreamUnavailable" and status >= 500,
+                details=merged_details,
+            ),
+            status=status,
+        )
+
+    async def _management_service_response(
+        self,
+        module_name: str,
+        function_name: str,
+        *args,
+        status: int = 200,
+        error_context: Optional[Dict[str, Any]] = None,
+        service_kwargs: Optional[Dict[str, Any]] = None,
+    ) -> "web.Response":
+        """Run one synchronous profile service off the aiohttp event loop."""
+        try:
+            result = await asyncio.to_thread(
+                _invoke_management_service,
+                module_name,
+                function_name,
+                *args,
+                **(service_kwargs or {}),
+            )
+        except Exception as exc:
+            return self._management_exception_response(exc, context=error_context)
+        if not isinstance(result, (dict, list)):
+            logger.error(
+                "Management service %s.%s returned unsupported result type %s",
+                module_name,
+                function_name,
+                type(result).__name__,
+            )
+            return web.json_response(
+                _management_error(
+                    "managementUpstreamUnavailable",
+                    retryable=True,
+                ),
+                status=500,
+            )
+        return web.json_response(result, status=status)
+
     @staticmethod
     def _normalize_callback_platform(value: str) -> str:
         normalized = (value or "").strip().lower().replace("-", "_")
@@ -2214,6 +2529,15 @@ class APIServerAdapter(BasePlatformAdapter):
         async def profile_prefix_middleware(request: "web.Request", handler):
             profile = self._resolve_request_profile(request)
             if profile is _PROFILE_REJECTED:
+                if "/api/management/" in request.path:
+                    return web.json_response(
+                        _management_error(
+                            "managementNotFound",
+                            "The requested Hermes profile is unavailable.",
+                            details={"resource": "profile"},
+                        ),
+                        status=404,
+                    )
                 return web.json_response(
                     {"error": "Unknown or unconfigured profile"},
                     status=404,
@@ -2240,6 +2564,27 @@ class APIServerAdapter(BasePlatformAdapter):
             ("GET", "/v1/models", self._handle_models),
             ("GET", "/api/model/options", self._handle_model_options),
             ("GET", "/v1/capabilities", self._handle_capabilities),
+            ("GET", "/api/management/capabilities", self._handle_management_capabilities),
+            ("GET", "/api/management/configuration", self._handle_management_configuration),
+            ("POST", "/api/management/configuration/validate", self._handle_management_configuration_validate),
+            ("PATCH", "/api/management/configuration", self._handle_management_configuration_update),
+            ("GET", "/api/management/documents", self._handle_management_documents),
+            ("GET", "/api/management/documents/{document_id}", self._handle_management_document),
+            ("PATCH", "/api/management/documents/{document_id}", self._handle_management_document_update),
+            ("POST", "/api/management/documents/{document_id}/validate", self._handle_management_document_validate),
+            ("POST", "/api/management/documents/{document_id}/revert", self._handle_management_document_revert),
+            ("GET", "/api/management/skills", self._handle_management_skills_list),
+            ("GET", "/api/management/skills/{skill_id}", self._handle_management_skill),
+            ("PATCH", "/api/management/skills/{skill_id}", self._handle_management_skill_update),
+            ("GET", "/api/management/schedules", self._handle_management_schedules_list),
+            ("POST", "/api/management/schedules", self._handle_management_schedule_create),
+            ("POST", "/api/management/schedules/validate", self._handle_management_schedule_validate),
+            ("GET", "/api/management/schedules/{schedule_id}", self._handle_management_schedule),
+            ("PATCH", "/api/management/schedules/{schedule_id}", self._handle_management_schedule_update),
+            ("DELETE", "/api/management/schedules/{schedule_id}", self._handle_management_schedule_delete),
+            ("POST", "/api/management/schedules/{schedule_id}/run", self._handle_management_schedule_run),
+            ("GET", "/api/management/schedules/{schedule_id}/history", self._handle_management_schedule_history),
+            ("GET", "/api/management/diagnostics", self._handle_management_diagnostics),
             ("GET", "/v1/skills", self._handle_skills),
             ("GET", "/v1/toolsets", self._handle_toolsets),
             ("GET", "/api/sessions", self._handle_list_sessions),
@@ -3121,6 +3466,475 @@ class APIServerAdapter(BasePlatformAdapter):
     # HTTP Handlers
     # ------------------------------------------------------------------
 
+    async def _handle_management_capabilities(
+        self, request: "web.Request"
+    ) -> "web.Response":
+        """GET /api/management/capabilities — per-operation feature flags."""
+        auth_err = self._check_management_auth(request)
+        if auth_err:
+            return auth_err
+        return await self._management_service_response(
+            "gateway.management_diagnostics",
+            "get_management_capabilities",
+        )
+
+    async def _handle_management_configuration(
+        self, request: "web.Request"
+    ) -> "web.Response":
+        """GET /api/management/configuration — safe editable profile config."""
+        auth_err = self._check_management_auth(request)
+        if auth_err:
+            return auth_err
+        return await self._management_service_response(
+            "gateway.management_profile",
+            "get_profile_configuration",
+        )
+
+    async def _handle_management_configuration_validate(
+        self, request: "web.Request"
+    ) -> "web.Response":
+        """POST /api/management/configuration/validate."""
+        auth_err = self._check_management_auth(request)
+        if auth_err:
+            return auth_err
+        payload, error = await self._read_management_payload(request)
+        if error:
+            return error
+        assert payload is not None
+        return await self._management_service_response(
+            "gateway.management_profile",
+            "validate_profile_configuration",
+            payload.get("content"),
+            error_context={"resource": "configuration"},
+        )
+
+    async def _handle_management_configuration_update(
+        self, request: "web.Request"
+    ) -> "web.Response":
+        """PATCH /api/management/configuration with optimistic concurrency."""
+        auth_err = self._check_management_auth(request)
+        if auth_err:
+            return auth_err
+        payload, error = await self._read_management_payload(request)
+        if error:
+            return error
+        assert payload is not None
+        expected_revision = payload.get("expectedRevision", payload.get("revision"))
+        return await self._management_service_response(
+            "gateway.management_profile",
+            "update_profile_configuration",
+            payload.get("content"),
+            expected_revision,
+            error_context={
+                "resource": "configuration",
+                "expectedRevision": expected_revision,
+            },
+        )
+
+    async def _handle_management_documents(
+        self, request: "web.Request"
+    ) -> "web.Response":
+        """GET /api/management/documents — allowlisted assistant files."""
+        auth_err = self._check_management_auth(request)
+        if auth_err:
+            return auth_err
+        return await self._management_service_response(
+            "gateway.management_profile",
+            "list_assistant_documents",
+        )
+
+    async def _handle_management_document(
+        self, request: "web.Request"
+    ) -> "web.Response":
+        """GET /api/management/documents/{document_id}."""
+        auth_err = self._check_management_auth(request)
+        if auth_err:
+            return auth_err
+        document_id = request.match_info.get("document_id", "")
+        return await self._management_service_response(
+            "gateway.management_profile",
+            "get_assistant_document",
+            document_id,
+            error_context={
+                "resource": "assistantDocument",
+                "resourceId": document_id,
+            },
+        )
+
+    async def _handle_management_document_validate(
+        self, request: "web.Request"
+    ) -> "web.Response":
+        """POST /api/management/documents/{document_id}/validate."""
+        auth_err = self._check_management_auth(request)
+        if auth_err:
+            return auth_err
+        payload, error = await self._read_management_payload(request)
+        if error:
+            return error
+        assert payload is not None
+        document_id = request.match_info.get("document_id", "")
+        return await self._management_service_response(
+            "gateway.management_profile",
+            "validate_assistant_document",
+            document_id,
+            payload.get("content"),
+            service_kwargs={
+                "line_ending": payload.get("lineEnding"),
+                "final_newline": payload.get("finalNewline"),
+            },
+            error_context={
+                "resource": "assistantDocument",
+                "resourceId": document_id,
+            },
+        )
+
+    async def _handle_management_document_update(
+        self, request: "web.Request"
+    ) -> "web.Response":
+        """PATCH /api/management/documents/{document_id}."""
+        auth_err = self._check_management_auth(request)
+        if auth_err:
+            return auth_err
+        payload, error = await self._read_management_payload(request)
+        if error:
+            return error
+        assert payload is not None
+        document_id = request.match_info.get("document_id", "")
+        expected_revision = payload.get("expectedRevision", payload.get("revision"))
+        return await self._management_service_response(
+            "gateway.management_profile",
+            "update_assistant_document",
+            document_id,
+            payload.get("content"),
+            expected_revision,
+            service_kwargs={
+                "line_ending": payload.get("lineEnding"),
+                "final_newline": payload.get("finalNewline"),
+            },
+            error_context={
+                "resource": "assistantDocument",
+                "resourceId": document_id,
+                "expectedRevision": expected_revision,
+            },
+        )
+
+    async def _handle_management_document_revert(
+        self, request: "web.Request"
+    ) -> "web.Response":
+        """POST /api/management/documents/{document_id}/revert."""
+        auth_err = self._check_management_auth(request)
+        if auth_err:
+            return auth_err
+        payload, error = await self._read_management_payload(request)
+        if error:
+            return error
+        assert payload is not None
+        document_id = request.match_info.get("document_id", "")
+        expected_revision = payload.get("expectedRevision", payload.get("revision"))
+        return await self._management_service_response(
+            "gateway.management_profile",
+            "revert_assistant_document",
+            document_id,
+            expected_revision,
+            service_kwargs={"backup_revision": payload.get("backupRevision")},
+            error_context={
+                "resource": "assistantDocument",
+                "resourceId": document_id,
+                "expectedRevision": expected_revision,
+            },
+        )
+
+    async def _handle_management_skills_list(
+        self, request: "web.Request"
+    ) -> "web.Response":
+        """GET /api/management/skills — searchable installed-skill list."""
+        auth_err = self._check_management_auth(request)
+        if auth_err:
+            return auth_err
+        query = request.query.get("q") or request.query.get("query")
+        return await self._management_service_response(
+            "gateway.management_skills",
+            "list_management_skills",
+            query,
+        )
+
+    async def _handle_management_skill(
+        self, request: "web.Request"
+    ) -> "web.Response":
+        """GET /api/management/skills/{skill_id}."""
+        auth_err = self._check_management_auth(request)
+        if auth_err:
+            return auth_err
+        skill_id = request.match_info.get("skill_id", "")
+        return await self._management_service_response(
+            "gateway.management_skills",
+            "read_management_skill",
+            skill_id,
+            error_context={"resource": "skill", "resourceId": skill_id},
+        )
+
+    async def _handle_management_skill_update(
+        self, request: "web.Request"
+    ) -> "web.Response":
+        """PATCH /api/management/skills/{skill_id}; currently read-only."""
+        auth_err = self._check_management_auth(request)
+        if auth_err:
+            return auth_err
+        payload, error = await self._read_management_payload(request)
+        if error:
+            return error
+        assert payload is not None
+        skill_id = request.match_info.get("skill_id", "")
+        return await self._management_service_response(
+            "gateway.management_skills",
+            "update_management_skill",
+            skill_id,
+            payload,
+            error_context={
+                "resource": "skill",
+                "resourceId": skill_id,
+                "expectedRevision": payload.get("expectedRevision", payload.get("revision")),
+            },
+        )
+
+    async def _handle_management_schedules_list(
+        self, request: "web.Request"
+    ) -> "web.Response":
+        """GET /api/management/schedules."""
+        auth_err = self._check_management_auth(request)
+        if auth_err:
+            return auth_err
+        return await self._management_service_response(
+            "gateway.management_schedules",
+            "list_schedules",
+        )
+
+    async def _handle_management_schedule_create(
+        self, request: "web.Request"
+    ) -> "web.Response":
+        """POST /api/management/schedules."""
+        auth_err = self._check_management_auth(request)
+        if auth_err:
+            return auth_err
+        payload, error = await self._read_management_payload(request)
+        if error:
+            return error
+        assert payload is not None
+        return await self._management_service_response(
+            "gateway.management_schedules",
+            "create_schedule",
+            payload,
+            error_context={"resource": "schedule"},
+        )
+
+    async def _handle_management_schedule_validate(
+        self, request: "web.Request"
+    ) -> "web.Response":
+        """POST /api/management/schedules/validate."""
+        auth_err = self._check_management_auth(request)
+        if auth_err:
+            return auth_err
+        payload, error = await self._read_management_payload(request)
+        if error:
+            return error
+        assert payload is not None
+        return await self._management_service_response(
+            "gateway.management_schedules",
+            "validate_schedule",
+            payload,
+            error_context={"resource": "schedule"},
+        )
+
+    async def _handle_management_schedule(
+        self, request: "web.Request"
+    ) -> "web.Response":
+        """GET /api/management/schedules/{schedule_id}."""
+        auth_err = self._check_management_auth(request)
+        if auth_err:
+            return auth_err
+        schedule_id = request.match_info.get("schedule_id", "")
+        return await self._management_service_response(
+            "gateway.management_schedules",
+            "get_schedule",
+            schedule_id,
+            error_context={"resource": "schedule", "resourceId": schedule_id},
+        )
+
+    async def _handle_management_schedule_update(
+        self, request: "web.Request"
+    ) -> "web.Response":
+        """PATCH /api/management/schedules/{schedule_id}."""
+        auth_err = self._check_management_auth(request)
+        if auth_err:
+            return auth_err
+        payload, error = await self._read_management_payload(request)
+        if error:
+            return error
+        assert payload is not None
+        schedule_id = request.match_info.get("schedule_id", "")
+        expected_revision = payload.get("expectedRevision", payload.get("revision"))
+        return await self._management_service_response(
+            "gateway.management_schedules",
+            "update_schedule",
+            schedule_id,
+            payload,
+            error_context={
+                "resource": "schedule",
+                "resourceId": schedule_id,
+                "expectedRevision": expected_revision,
+            },
+        )
+
+    async def _handle_management_schedule_delete(
+        self, request: "web.Request"
+    ) -> "web.Response":
+        """DELETE /api/management/schedules/{schedule_id}."""
+        auth_err = self._check_management_auth(request)
+        if auth_err:
+            return auth_err
+        payload, error = await self._read_management_payload(request, allow_empty=True)
+        if error:
+            return error
+        assert payload is not None
+        schedule_id = request.match_info.get("schedule_id", "")
+        expected_revision = payload.get("expectedRevision", payload.get("revision"))
+        return await self._management_service_response(
+            "gateway.management_schedules",
+            "delete_schedule",
+            schedule_id,
+            payload,
+            error_context={
+                "resource": "schedule",
+                "resourceId": schedule_id,
+                "expectedRevision": expected_revision,
+            },
+        )
+
+    async def _handle_management_schedule_run(
+        self, request: "web.Request"
+    ) -> "web.Response":
+        """POST /api/management/schedules/{schedule_id}/run."""
+        auth_err = self._check_management_auth(request)
+        if auth_err:
+            return auth_err
+        payload, error = await self._read_management_payload(request, allow_empty=True)
+        if error:
+            return error
+        assert payload is not None
+        schedule_id = request.match_info.get("schedule_id", "")
+        if self._gateway_is_draining():
+            return web.json_response(
+                _management_error(
+                    "managementUpstreamUnavailable",
+                    "Hermes Agent is draining and cannot start a schedule run.",
+                    retryable=True,
+                ),
+                status=503,
+            )
+
+        # Validation and reservation are one admission handoff: once the
+        # reservation is visible, gateway shutdown cannot miss the background
+        # schedule execution between its precondition check and task creation.
+        with _reserve_pending_api_work(self) as reservation:
+            try:
+                accepted = await asyncio.to_thread(
+                    _invoke_management_service,
+                    "gateway.management_schedules",
+                    "run_schedule_now",
+                    schedule_id,
+                    payload,
+                )
+            except Exception as exc:
+                return self._management_exception_response(
+                    exc,
+                    context={"resource": "schedule", "resourceId": schedule_id},
+                )
+
+            runner = self.gateway_runner
+            adapters = getattr(runner, "adapters", None) if runner is not None else None
+            loop = asyncio.get_running_loop()
+            task = asyncio.create_task(
+                asyncio.to_thread(
+                    _invoke_management_service,
+                    "gateway.management_schedules",
+                    "execute_schedule_now",
+                    schedule_id,
+                    adapters,
+                    loop,
+                )
+            )
+            reservation["detached"] = True
+            try:
+                self._background_tasks.add(task)
+            except (TypeError, AttributeError):
+                pass
+
+            def _schedule_run_finished(completed: "asyncio.Task[Any]") -> None:
+                _release_pending_api_work(self, reservation)
+                try:
+                    self._background_tasks.discard(completed)
+                except (TypeError, AttributeError):
+                    pass
+                try:
+                    completed.result()
+                except asyncio.CancelledError:
+                    return
+                except Exception as exc:
+                    # Background errors are discoverable through bounded
+                    # schedule history; do not log exception text that might
+                    # contain a path or prompt fragment.
+                    logger.error(
+                        "Management schedule run failed for id=%r (%s)",
+                        schedule_id,
+                        type(exc).__name__,
+                    )
+
+            task.add_done_callback(_schedule_run_finished)
+            return web.json_response(accepted, status=202)
+
+    async def _handle_management_schedule_history(
+        self, request: "web.Request"
+    ) -> "web.Response":
+        """GET /api/management/schedules/{schedule_id}/history?limit=N."""
+        auth_err = self._check_management_auth(request)
+        if auth_err:
+            return auth_err
+        raw_limit = request.query.get("limit", "20")
+        try:
+            limit = int(raw_limit)
+        except (TypeError, ValueError):
+            limit = 0
+        if not 1 <= limit <= 100:
+            return web.json_response(
+                _management_error(
+                    "managementValidationFailed",
+                    "History limit must be between 1 and 100.",
+                    details={"field": "limit", "limit": limit},
+                ),
+                status=400,
+            )
+        schedule_id = request.match_info.get("schedule_id", "")
+        return await self._management_service_response(
+            "gateway.management_schedules",
+            "list_schedule_history",
+            schedule_id,
+            limit,
+            error_context={"resource": "schedule", "resourceId": schedule_id},
+        )
+
+    async def _handle_management_diagnostics(
+        self, request: "web.Request"
+    ) -> "web.Response":
+        """GET /api/management/diagnostics — redacted profile diagnostics."""
+        auth_err = self._check_management_auth(request)
+        if auth_err:
+            return auth_err
+        return await self._management_service_response(
+            "gateway.management_diagnostics",
+            "get_management_diagnostics",
+            _hermes_version(),
+        )
+
     async def _handle_health(self, request: "web.Request") -> "web.Response":
         """GET /health — simple health check."""
         return web.json_response(
@@ -3326,6 +4140,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 "session_steer": True,
                 "session_relationship_type": True,
                 "session_model_lock": True,
+                "management_api": True,
+                "management_api_version": 1,
                 "admin_config_rw": False,
                 "jobs_admin": False,
                 "memory_write_api": False,
@@ -3361,6 +4177,12 @@ class APIServerAdapter(BasePlatformAdapter):
                 "session_chat": {"method": "POST", "path": "/api/sessions/{session_id}/chat"},
                 "session_chat_stream": {"method": "POST", "path": "/api/sessions/{session_id}/chat/stream"},
                 "session_model_lock": {"method": "POST", "path": "/api/sessions/{session_id}/model"},
+                "management_capabilities": {"method": "GET", "path": "/api/management/capabilities"},
+                "management_configuration": {"method": "GET", "path": "/api/management/configuration"},
+                "management_documents": {"method": "GET", "path": "/api/management/documents"},
+                "management_skills": {"method": "GET", "path": "/api/management/skills"},
+                "management_schedules": {"method": "GET", "path": "/api/management/schedules"},
+                "management_diagnostics": {"method": "GET", "path": "/api/management/diagnostics"},
             },
         })
 
