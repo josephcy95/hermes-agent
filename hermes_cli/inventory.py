@@ -53,6 +53,10 @@ class ConfigContext:
     user_providers: dict
     custom_providers: list
     excluded_providers: list = None
+    # Effective profile/session reasoning effort when explicitly configured.
+    # ``None`` means the provider/model default is inherited and not known from
+    # Hermes config; do not manufacture ``medium`` in that case.
+    current_reasoning_effort: Optional[str] = None
 
     def with_overrides(
         self,
@@ -60,6 +64,7 @@ class ConfigContext:
         current_provider: Optional[str] = None,
         current_model: Optional[str] = None,
         current_base_url: Optional[str] = None,
+        current_reasoning_effort: Optional[str] = None,
     ) -> "ConfigContext":
         """Return a copy with truthy overrides applied.
 
@@ -74,6 +79,8 @@ class ConfigContext:
             kw["current_model"] = current_model
         if current_base_url:
             kw["current_base_url"] = current_base_url
+        if current_reasoning_effort:
+            kw["current_reasoning_effort"] = current_reasoning_effort
         return replace(self, **kw) if kw else self
 
 
@@ -96,6 +103,23 @@ def load_picker_context() -> ConfigContext:
         current_model = str(model_cfg) if model_cfg else ""
         current_provider = ""
         current_base_url = ""
+    current_reasoning_effort = None
+    try:
+        from hermes_constants import resolve_reasoning_config
+
+        reasoning_config = resolve_reasoning_config(cfg, current_model)
+        if isinstance(reasoning_config, dict):
+            if reasoning_config.get("enabled") is False:
+                current_reasoning_effort = "none"
+            else:
+                effort = reasoning_config.get("effort")
+                if isinstance(effort, str) and effort.strip():
+                    current_reasoning_effort = effort.strip().lower()
+    except Exception:
+        # Picker discovery must stay available even when a hand-edited config
+        # contains an unparseable reasoning setting.
+        current_reasoning_effort = None
+
     raw = cfg.get("providers")
     excluded = cfg.get("model_catalog", {}).get("excluded_providers") or []
     return ConfigContext(
@@ -105,6 +129,7 @@ def load_picker_context() -> ConfigContext:
         user_providers=raw if isinstance(raw, dict) else {},
         custom_providers=get_compatible_custom_providers(cfg),
         excluded_providers=excluded if isinstance(excluded, list) else [],
+        current_reasoning_effort=current_reasoning_effort,
     )
 
 
@@ -273,11 +298,14 @@ def build_models_payload(
     if featured:
         _apply_featured(rows)
 
-    return {
+    payload = {
         "providers": rows,
         "model": ctx.current_model,
         "provider": ctx.current_provider,
     }
+    if ctx.current_reasoning_effort is not None:
+        payload["reasoning_effort"] = ctx.current_reasoning_effort
+    return payload
 
 
 def build_model_options_payload(
@@ -402,24 +430,25 @@ def format_aux_picker_entries(
 
 
 def _apply_capabilities(rows: list[dict]) -> None:
-    """Attach a ``{model: {fast, reasoning}}`` map to each provider row.
+    """Attach per-model controls plus catalog limits to each provider row.
 
-    `fast` mirrors ``model_supports_fast_mode`` (the same gate the runtime
-    enforces). `reasoning` comes from the models.dev catalog when known and
-    defaults to True otherwise — the effort dial is broadly accepted and a
-    no-op on models that ignore it, whereas hiding it from a capable-but-
-    uncatalogued model is the worse failure.
+    ``fast`` and ``reasoning`` retain their existing picker semantics.  The
+    optional ``context_window`` and ``max_output_tokens`` values come directly
+    from the models.dev limit fields and are omitted when the catalog has no
+    positive value; in particular, do not substitute the broad defaults used
+    by the runtime capability helper for unknown catalog data.
     """
     from hermes_cli.models import model_supports_fast_mode
 
     try:
-        from agent.models_dev import get_model_capabilities
+        from agent.models_dev import get_model_capabilities, get_model_info
     except Exception:
         get_model_capabilities = None  # type: ignore[assignment]
+        get_model_info = None  # type: ignore[assignment]
 
     for row in rows:
         slug = row.get("slug") or ""
-        caps: dict[str, dict[str, bool]] = {}
+        caps: dict[str, dict[str, object]] = {}
 
         for model in row.get("models") or []:
             reasoning = True
@@ -431,10 +460,31 @@ def _apply_capabilities(rows: list[dict]) -> None:
                 except Exception:
                     reasoning = True
 
-            caps[model] = {
+            capability: dict[str, object] = {
                 "fast": bool(model_supports_fast_mode(model)),
                 "reasoning": reasoning,
             }
+
+            # ``get_model_info`` preserves zero for an unknown limit.  For
+            # aggregator rows, the OpenRouter catalog is a safe fallback for
+            # vendor/model ids that are not duplicated under the row's slug.
+            model_info = None
+            if get_model_info is not None and slug:
+                try:
+                    model_info = get_model_info(slug, model)
+                    if model_info is None and "/" in str(model):
+                        model_info = get_model_info("openrouter", model)
+                except Exception:
+                    model_info = None
+            if model_info is not None:
+                context_window = getattr(model_info, "context_window", 0)
+                max_output_tokens = getattr(model_info, "max_output", 0)
+                if isinstance(context_window, (int, float)) and context_window > 0:
+                    capability["context_window"] = int(context_window)
+                if isinstance(max_output_tokens, (int, float)) and max_output_tokens > 0:
+                    capability["max_output_tokens"] = int(max_output_tokens)
+
+            caps[model] = capability
 
         row["capabilities"] = caps
 

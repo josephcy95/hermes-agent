@@ -2289,8 +2289,15 @@ class AIAgent:
                         self, "_active_compression_lock_holder", None
                     ),
                 )
-                for _written in _batch_msgs:
-                    _written[_DB_PERSISTED_MARKER] = True
+                # The batch serializer annotates each inserted copy with its
+                # durable SQLite row id. Carry that identity back to the live
+                # transcript so API surfaces can update the exact final
+                # assistant row without content matching or latest-row races.
+                for _written, _source in zip(_batch_rows, _batch_msgs):
+                    _row_id = _written.get("_row_id")
+                    if _row_id is not None:
+                        _source["_row_id"] = _row_id
+                    _source[_DB_PERSISTED_MARKER] = True
             # The intrinsic markers are now the sole source of truth. Reset the
             # one-shot seed so no id() outlives this flush to alias a message
             # allocated next turn at a recycled address.

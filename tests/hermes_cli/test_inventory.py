@@ -19,6 +19,7 @@ depend on:
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from unittest.mock import patch
 
 
@@ -513,3 +514,69 @@ def _apply_featured_with_dates(rows, dates: dict[str, str]):
 
 
 
+
+
+def test_model_capabilities_preserve_controls_and_add_catalog_limits():
+    rows = [_nous_row("openai/gpt-5.5")]
+    model_info = SimpleNamespace(context_window=131072, max_output=16384)
+    model_caps = SimpleNamespace(supports_reasoning=False)
+    with (
+        _list_auth_returning(rows),
+        patch("hermes_cli.models.model_supports_fast_mode", return_value=True),
+        patch("agent.models_dev.get_model_capabilities", return_value=model_caps),
+        patch("agent.models_dev.get_model_info", return_value=model_info),
+    ):
+        payload = build_models_payload(_empty_ctx(), capabilities=True)
+
+    nous = next(row for row in payload["providers"] if row["slug"] == "nous")
+    assert nous["capabilities"]["openai/gpt-5.5"] == {
+        "fast": True,
+        "reasoning": False,
+        "context_window": 131072,
+        "max_output_tokens": 16384,
+    }
+
+
+def test_model_capabilities_omit_unknown_catalog_limits():
+    rows = [_nous_row("uncatalogued-model")]
+    model_info = SimpleNamespace(context_window=0, max_output=0)
+    with (
+        _list_auth_returning(rows),
+        patch("hermes_cli.models.model_supports_fast_mode", return_value=False),
+        patch("agent.models_dev.get_model_capabilities", return_value=None),
+        patch("agent.models_dev.get_model_info", return_value=model_info),
+    ):
+        payload = build_models_payload(_empty_ctx(), capabilities=True)
+
+    nous = next(row for row in payload["providers"] if row["slug"] == "nous")
+    caps = nous["capabilities"]["uncatalogued-model"]
+    assert caps == {"fast": False, "reasoning": True}
+
+
+def test_model_options_payload_exposes_known_reasoning_effort():
+    ctx = _empty_ctx().with_overrides(current_reasoning_effort="high")
+    with _list_auth_returning([]):
+        payload = build_models_payload(ctx)
+    assert payload["reasoning_effort"] == "high"
+
+
+def test_load_picker_context_resolves_profile_reasoning_effort():
+    cfg = _cfg(model={"default": "gpt-5"})
+    cfg["agent"] = {"reasoning_effort": "high"}
+    with (
+        patch("hermes_cli.config.load_config", return_value=cfg),
+        patch("hermes_cli.config.get_compatible_custom_providers", return_value=[]),
+    ):
+        ctx = load_picker_context()
+    assert ctx.current_reasoning_effort == "high"
+
+
+def test_load_picker_context_reports_explicit_reasoning_disable():
+    cfg = _cfg(model={"default": "gpt-5"})
+    cfg["agent"] = {"reasoning_effort": False}
+    with (
+        patch("hermes_cli.config.load_config", return_value=cfg),
+        patch("hermes_cli.config.get_compatible_custom_providers", return_value=[]),
+    ):
+        ctx = load_picker_context()
+    assert ctx.current_reasoning_effort == "none"

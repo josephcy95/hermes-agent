@@ -20,6 +20,7 @@ import sys
 import time
 import types
 import uuid
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -30,6 +31,7 @@ from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.api_server import (
     APIServerAdapter,
     ResponseStore,
+    _build_response_metrics,
     _IdempotencyCache,
     _derive_chat_session_id,
     _hermes_version,
@@ -871,6 +873,11 @@ class TestCapabilitiesEndpoint:
             assert data["features"]["run_status"] is True
             assert data["features"]["run_events_sse"] is True
             assert data["features"]["model_options"] is True
+            assert data["features"]["model_options_capabilities"] is True
+            assert data["features"]["model_options_reasoning_effort"] is True
+            assert data["features"]["response_metrics"] is True
+            assert data["features"]["response_metrics_persistence"] is True
+            assert data["features"]["session_context_usage"] is True
             assert data["features"]["session_continuity_header"] == "X-Hermes-Session-Id"
             assert data["endpoints"]["run_status"]["path"] == "/v1/runs/{run_id}"
             assert data["endpoints"]["model_options"] == {"method": "GET", "path": "/api/model/options"}
@@ -955,12 +962,71 @@ class TestToolsetsEndpoint:
         )
 
 
+class TestResponseMetrics:
+    def test_build_uses_runtime_context_and_omits_invalid_prompt_count(self):
+        compressor = SimpleNamespace(last_prompt_tokens=1200, context_length=8000)
+        agent = SimpleNamespace(
+            context_compressor=compressor,
+            session_prompt_tokens=999999,
+        )
+        assert _build_response_metrics(agent, 321) == {
+            "elapsed_ms": 321,
+            "context_used": 1200,
+            "context_max": 8000,
+            "context_percent": 15.0,
+        }
+
+        compressor.last_prompt_tokens = 0
+        assert _build_response_metrics(agent, 10) == {
+            "elapsed_ms": 10,
+            "context_max": 8000,
+        }
+
+    def test_message_response_exposes_only_persisted_response_metrics(self):
+        metrics = {"elapsed_ms": 12, "context_used": 10}
+        payload = APIServerAdapter._message_response(
+            {
+                "id": 7,
+                "role": "assistant",
+                "content": "same",
+                "display_metadata": {"response_metrics": metrics, "private": "hidden"},
+            }
+        )
+        assert payload["response_metrics"] == metrics
+        assert "display_metadata" not in payload
+
+    def test_session_response_exposes_context_usage_additively(self):
+        payload = APIServerAdapter._session_response(
+            {"id": "s1", "_context_usage": {"context_used": 10, "context_max": 100}},
+        )
+        assert payload["context_usage"] == {"context_used": 10, "context_max": 100}
+
+
 # ---------------------------------------------------------------------------
 # /v1/chat/completions endpoint
 # ---------------------------------------------------------------------------
 
 
 class TestChatCompletionsEndpoint:
+    @pytest.mark.asyncio
+    async def test_non_stream_emits_additive_response_metrics(self, adapter):
+        app = _create_app(adapter)
+        metrics = {"elapsed_ms": 44, "context_used": 400, "context_max": 1000, "context_percent": 40.0}
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                mock_run.return_value = (
+                    {"final_response": "ok", "messages": [], "api_calls": 1, "response_metrics": metrics},
+                    {"input_tokens": 4, "output_tokens": 2, "total_tokens": 6},
+                )
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    json={"model": "test", "messages": [{"role": "user", "content": "hi"}]},
+                )
+                assert resp.status == 200
+                data = await resp.json()
+        assert data["response_metrics"] == metrics
+        assert data["usage"] == {"prompt_tokens": 4, "completion_tokens": 2, "total_tokens": 6}
+
     @pytest.mark.asyncio
     async def test_invalid_json_returns_400(self, adapter):
         app = _create_app(adapter)
@@ -994,7 +1060,17 @@ class TestChatCompletionsEndpoint:
             if cb:
                 cb("ok")
             return (
-                {"final_response": "ok", "messages": [], "api_calls": 1},
+                {
+                    "final_response": "ok",
+                    "messages": [],
+                    "api_calls": 1,
+                    "response_metrics": {
+                        "elapsed_ms": 42,
+                        "context_used": 120,
+                        "context_max": 1000,
+                        "context_percent": 12.0,
+                    },
+                },
                 {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
             )
 
@@ -1015,11 +1091,42 @@ class TestChatCompletionsEndpoint:
                 body = await resp.text()
 
         assert "data: " in body
+        finish_payloads = []
+        for line in body.splitlines():
+            if not line.startswith("data: ") or line == "data: [DONE]":
+                continue
+            try:
+                payload = json.loads(line[len("data: "):])
+            except json.JSONDecodeError:
+                continue
+            if payload.get("object") == "chat.completion.chunk" and payload.get("choices", [{}])[0].get("finish_reason"):
+                finish_payloads.append(payload)
+        assert finish_payloads[-1]["response_metrics"]["context_used"] == 120
         kwargs = mock_run.call_args.kwargs
         assert kwargs["requested_model"] == "MiniMax-M3"
         assert kwargs["requested_provider"] == "minimax"
         assert kwargs["model_options"] == model_options
 
+
+    @pytest.mark.asyncio
+    async def test_session_chat_emits_additive_response_metrics(self, adapter):
+        app = _create_app(adapter)
+        metrics = {"elapsed_ms": 61, "context_used": 300, "context_max": 1000, "context_percent": 30.0}
+        async with TestClient(TestServer(app)) as cli:
+            with (
+                patch.object(adapter, "_get_existing_session_or_404", return_value=({"id": "s1"}, None)),
+                patch.object(adapter, "_conversation_history_for_session", return_value=[]),
+                patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run,
+            ):
+                mock_run.return_value = (
+                    {"final_response": "ok", "messages": [], "api_calls": 1, "response_metrics": metrics},
+                    {"input_tokens": 3, "output_tokens": 2, "total_tokens": 5},
+                )
+                resp = await cli.post("/api/sessions/s1/chat", json={"message": "hi"})
+                assert resp.status == 200
+                data = await resp.json()
+        assert data["response_metrics"] == metrics
+        assert data["usage"] == {"input_tokens": 3, "output_tokens": 2, "total_tokens": 5}
 
     @pytest.mark.asyncio
     async def test_session_chat_stream_passes_request_model_provider_options(self, adapter):
@@ -1032,7 +1139,12 @@ class TestChatCompletionsEndpoint:
                 patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run,
             ):
                 mock_run.return_value = (
-                    {"final_response": "ok", "messages": [], "api_calls": 1},
+                    {
+                        "final_response": "ok",
+                        "messages": [],
+                        "api_calls": 1,
+                        "response_metrics": {"elapsed_ms": 55, "context_used": 222},
+                    },
                     {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
                 )
                 resp = await cli.post(
@@ -1048,6 +1160,12 @@ class TestChatCompletionsEndpoint:
                 body = await resp.text()
 
         assert "event: run.completed" in body
+        completed_data = []
+        lines = body.splitlines()
+        for index, line in enumerate(lines):
+            if line == "event: run.completed" and index + 1 < len(lines):
+                completed_data.append(json.loads(lines[index + 1][len("data: "):]))
+        assert completed_data[-1]["response_metrics"] == {"elapsed_ms": 55, "context_used": 222}
         kwargs = mock_run.call_args.kwargs
         assert kwargs["requested_model"] == "MiniMax-M3"
         assert kwargs["requested_provider"] == "minimax"

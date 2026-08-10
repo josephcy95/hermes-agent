@@ -8126,6 +8126,80 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         return bool(self._execute_write(_do))
 
+    def merge_message_display_metadata(
+        self,
+        session_id: str,
+        message_row_id: int,
+        metadata: Dict[str, Any],
+    ) -> bool:
+        """Merge presentation metadata onto one active assistant row by id.
+
+        This is deliberately keyed by the durable SQLite message id rather than
+        role/content/latest-row heuristics. API response telemetry can therefore
+        be attached to the exact final assistant message even when turns share
+        identical text or another session request is completing concurrently.
+        """
+        if (
+            not session_id
+            or isinstance(message_row_id, bool)
+            or not isinstance(message_row_id, int)
+            or message_row_id <= 0
+            or not isinstance(metadata, dict)
+            or not metadata
+        ):
+            return False
+
+        def _do(conn):
+            row = conn.execute(
+                "SELECT display_metadata FROM messages "
+                "WHERE id = ? AND session_id = ? AND role = 'assistant' AND active = 1",
+                (message_row_id, session_id),
+            ).fetchone()
+            if row is None:
+                return False
+            current = self._decode_display_metadata(row[0]) or {}
+            if not isinstance(current, dict):
+                current = {}
+            for key, value in metadata.items():
+                if isinstance(key, str):
+                    current[key] = value
+            cursor = conn.execute(
+                "UPDATE messages SET display_metadata = ? WHERE id = ? "
+                "AND session_id = ? AND role = 'assistant' AND active = 1",
+                (self._encode_display_metadata(current), message_row_id, session_id),
+            )
+            return cursor.rowcount > 0
+
+        return bool(self._execute_write(_do))
+
+    def get_latest_response_context_usage(
+        self, session_id: str
+    ) -> Optional[Dict[str, Any]]:
+        """Return the latest persisted response context metrics for a session."""
+        if not session_id:
+            return None
+
+        with self._read_ctx() as conn:
+            rows = conn.execute(
+                "SELECT display_metadata FROM messages "
+                "WHERE session_id = ? AND role = 'assistant' AND active = 1 "
+                "AND display_metadata IS NOT NULL ORDER BY id DESC",
+                (session_id,),
+            ).fetchall()
+        for row in rows:
+            metadata = self._decode_display_metadata(row[0]) or {}
+            metrics = metadata.get("response_metrics") if isinstance(metadata, dict) else None
+            if not isinstance(metrics, dict):
+                continue
+            usage = {
+                key: metrics[key]
+                for key in ("context_used", "context_max", "context_percent")
+                if key in metrics
+            }
+            if usage:
+                return usage
+        return None
+
     #: Key under which message reactions live inside ``display_metadata``.
     #: Reactions share the existing per-message JSON column rather than a side
     #: table so they survive rewind/compaction row rewrites with the row itself.
@@ -8387,7 +8461,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
             api_content = msg.get("api_content")
 
-            conn.execute(
+            cursor = conn.execute(
                 """INSERT INTO messages (session_id, role, content, tool_call_id,
                    tool_calls, tool_name, effect_disposition, timestamp, token_count, finish_reason,
                    reasoning, reasoning_content, reasoning_details, codex_reasoning_items,
@@ -8417,6 +8491,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     self._encode_display_metadata(msg.get("display_metadata")),
                 ),
             )
+            # Private durable identity for callers that need to address this
+            # exact inserted row later. It is never persisted as a column and
+            # wire serializers intentionally strip underscore-prefixed fields.
+            msg["_row_id"] = cursor.lastrowid
             inserted += 1
             if tool_calls is not None:
                 tool_calls_total += (

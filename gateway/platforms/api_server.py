@@ -49,6 +49,7 @@ from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
 from functools import wraps
 import logging
+import math
 import os
 import re
 import sqlite3
@@ -407,6 +408,113 @@ def _request_agent_overrides(
     if isinstance(model_options, dict):
         overrides["model_options"] = dict(model_options)
     return overrides
+
+
+def _build_response_metrics(agent: Any, elapsed_ms: int) -> Dict[str, Any]:
+    """Build additive whole-turn telemetry from monotonic/runtime state.
+
+    ``session_prompt_tokens`` and related counters are cumulative billing
+    totals, so they are intentionally not used here. Context usage is sourced
+    only from the compressor's latest provider-reported prompt count when it is
+    a positive integer; a zero/negative fallback means the value is unknown.
+    """
+    try:
+        elapsed = int(elapsed_ms)
+    except (TypeError, ValueError, OverflowError):
+        elapsed = 0
+    metrics: Dict[str, Any] = {"elapsed_ms": max(0, elapsed)}
+
+    compressor = getattr(agent, "context_compressor", None) if agent is not None else None
+    if compressor is None:
+        return metrics
+
+    def _positive_integer(value: Any) -> Optional[int]:
+        # Token counts and context lengths are integral quantities. Accept an
+        # integer-valued float from a duck-typed runtime, but never publish
+        # fractional, NaN, infinity, or boolean values as telemetry.
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, int):
+            return value if value > 0 else None
+        if isinstance(value, float) and math.isfinite(value) and value.is_integer() and value > 0:
+            return int(value)
+        return None
+
+    try:
+        context_used = getattr(compressor, "last_prompt_tokens", None)
+    except Exception:
+        context_used = None
+    context_used = _positive_integer(context_used)
+    if context_used is not None:
+        metrics["context_used"] = context_used
+
+    try:
+        context_max = getattr(compressor, "context_length", None)
+    except Exception:
+        context_max = None
+    context_max = _positive_integer(context_max)
+    if context_max is not None:
+        metrics["context_max"] = context_max
+
+    if context_used is not None and context_max is not None:
+        metrics["context_percent"] = round(context_used / context_max * 100, 2)
+    return metrics
+
+
+def _persist_response_metrics(
+    agent: Any,
+    result: Any,
+    response_metrics: Dict[str, Any],
+) -> bool:
+    """Persist metrics on the exact final assistant row when row identity exists.
+
+    The live transcript receives ``_row_id`` from SessionDB's insert path. No
+    content comparison or "latest assistant" lookup is used here, which keeps
+    identical replies and concurrent turns from receiving one another's
+    telemetry. Persistence is best-effort and never changes the response path.
+    """
+    if not isinstance(result, dict) or not isinstance(response_metrics, dict):
+        return False
+    messages = result.get("messages")
+    if not isinstance(messages, list):
+        return False
+
+    row_id = None
+    for message in reversed(messages):
+        if not isinstance(message, dict) or message.get("role") != "assistant":
+            continue
+        candidate = message.get("_row_id")
+        if (
+            isinstance(candidate, int)
+            and not isinstance(candidate, bool)
+            and candidate > 0
+        ):
+            row_id = candidate
+            break
+    if row_id is None:
+        return False
+
+    db = getattr(agent, "_session_db", None) if agent is not None else None
+    merge = getattr(db, "merge_message_display_metadata", None)
+    session_id = getattr(agent, "session_id", None) if agent is not None else None
+    if not callable(merge) or not isinstance(session_id, str) or not session_id:
+        return False
+    try:
+        return bool(
+            merge(
+                session_id,
+                row_id,
+                {"response_metrics": dict(response_metrics)},
+            )
+        )
+    except Exception:
+        logger.debug(
+            "Could not persist response metrics for session=%s row=%s",
+            session_id,
+            row_id,
+            exc_info=True,
+        )
+        return False
 
 
 def _message_text_prefix(content: Any) -> str:
@@ -3124,6 +3232,11 @@ class APIServerAdapter(BasePlatformAdapter):
                 "approval_events": True,
                 "session_resources": True,
                 "model_options": True,
+                "model_options_capabilities": True,
+                "model_options_reasoning_effort": True,
+                "response_metrics": True,
+                "response_metrics_persistence": True,
+                "session_context_usage": True,
                 "session_chat": True,
                 "session_chat_streaming": True,
                 "session_fork": True,
@@ -3415,6 +3528,15 @@ class APIServerAdapter(BasePlatformAdapter):
         payload["has_system_prompt"] = bool(session.get("system_prompt"))
         payload["has_model_config"] = bool(session.get("model_config"))
         payload["relationship_type"] = relationship_type
+        context_usage = session.get("_context_usage")
+        if not isinstance(context_usage, dict):
+            context_usage = session.get("context_usage")
+        if isinstance(context_usage, dict):
+            payload["context_usage"] = {
+                key: context_usage[key]
+                for key in ("context_used", "context_max", "context_percent")
+                if key in context_usage
+            }
         if runtime is not None:
             payload["runtime"] = runtime
         return payload
@@ -3426,7 +3548,18 @@ class APIServerAdapter(BasePlatformAdapter):
             "tool_name", "timestamp", "token_count", "finish_reason", "reasoning",
             "reasoning_content",
         )
-        return {key: message.get(key) for key in safe_keys if key in message}
+        payload = {key: message.get(key) for key in safe_keys if key in message}
+        response_metrics = message.get("response_metrics")
+        if not isinstance(response_metrics, dict):
+            display_metadata = message.get("display_metadata")
+            response_metrics = (
+                display_metadata.get("response_metrics")
+                if isinstance(display_metadata, dict)
+                else None
+            )
+        if isinstance(response_metrics, dict):
+            payload["response_metrics"] = dict(response_metrics)
+        return payload
 
     async def _read_json_body(self, request: "web.Request") -> tuple[Dict[str, Any], Optional["web.Response"]]:
         try:
@@ -3641,6 +3774,12 @@ class APIServerAdapter(BasePlatformAdapter):
         if err:
             return err
         db = await self._ensure_session_db_async()
+        latest_context_usage = await asyncio.to_thread(
+            db.get_latest_response_context_usage, session.get("id")
+        )
+        if latest_context_usage:
+            session = dict(session)
+            session["_context_usage"] = latest_context_usage
         relationship_types = await asyncio.to_thread(
             db.get_session_relationship_types, [session.get("id")]
         )
@@ -4024,16 +4163,17 @@ class APIServerAdapter(BasePlatformAdapter):
                 else ""
             ),
         )
-        return web.json_response(
-            {
-                "object": "hermes.session.chat.completion",
-                "session_id": effective_session_id or session_id,
-                "message": {"role": "assistant", "content": final_response},
-                "usage": usage,
-                "runtime": runtime,
-            },
-            headers=headers,
-        )
+        response_data = {
+            "object": "hermes.session.chat.completion",
+            "session_id": effective_session_id or session_id,
+            "message": {"role": "assistant", "content": final_response},
+            "usage": usage,
+            "runtime": runtime,
+        }
+        response_metrics = result.get("response_metrics") if isinstance(result, dict) else None
+        if isinstance(response_metrics, dict):
+            response_data["response_metrics"] = dict(response_metrics)
+        return web.json_response(response_data, headers=headers)
 
     @_admit_api_agent_request
     async def _handle_session_chat_stream(self, request: "web.Request") -> "web.StreamResponse":
@@ -4187,7 +4327,8 @@ class APIServerAdapter(BasePlatformAdapter):
                         else ""
                     ),
                 )
-                await queue.put(_event_payload("assistant.completed", {
+                response_metrics = result.get("response_metrics") if isinstance(result, dict) else None
+                assistant_completed = {
                     "session_id": effective_session_id,
                     "message_id": message_id,
                     "content": final_response,
@@ -4195,15 +4336,20 @@ class APIServerAdapter(BasePlatformAdapter):
                     "partial": False,
                     "interrupted": False,
                     "runtime": effective_runtime,
-                }))
-                await queue.put(_event_payload("run.completed", {
+                }
+                run_completed = {
                     "session_id": effective_session_id,
                     "message_id": message_id,
                     "completed": True,
                     "messages": turn_messages,
                     "usage": usage,
                     "runtime": effective_runtime,
-                }))
+                }
+                if isinstance(response_metrics, dict):
+                    assistant_completed["response_metrics"] = dict(response_metrics)
+                    run_completed["response_metrics"] = dict(response_metrics)
+                await queue.put(_event_payload("assistant.completed", assistant_completed))
+                await queue.put(_event_payload("run.completed", run_completed))
             except Exception as exc:
                 logger.exception("[api_server] session chat stream failed")
                 await queue.put(_event_payload("error", {"message": _redact_api_error_text(exc)}))
@@ -4635,6 +4781,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 "total_tokens": usage.get("total_tokens", 0),
             },
         }
+        response_metrics = result.get("response_metrics") if isinstance(result, dict) else None
+        if isinstance(response_metrics, dict):
+            response_data["response_metrics"] = dict(response_metrics)
         if is_partial or is_failed or not completed:
             response_data["hermes"] = {
                 "completed": completed,
@@ -4791,6 +4940,9 @@ class APIServerAdapter(BasePlatformAdapter):
                     "total_tokens": usage.get("total_tokens", 0),
                 },
             }
+            response_metrics = result.get("response_metrics") if isinstance(result, dict) else None
+            if isinstance(response_metrics, dict):
+                finish_chunk["response_metrics"] = dict(response_metrics)
             if finish_reason != "stop":
                 finish_chunk["choices"][0]["delta"] = {}
                 if err_msg:
@@ -6424,6 +6576,10 @@ class APIServerAdapter(BasePlatformAdapter):
         request_profile = _api_request_profile.get()
 
         def _run():
+            # Monotonic start is captured before agent construction so the
+            # telemetry covers the whole server-side turn, not just the final
+            # provider call. Wall-clock changes cannot make elapsed_ms jump.
+            turn_started = time.monotonic()
             from gateway.session_context import clear_session_vars
 
             with self._profile_scope(request_profile):
@@ -6470,6 +6626,13 @@ class APIServerAdapter(BasePlatformAdapter):
                         conversation_history=conversation_history,
                         task_id=effective_task_id,
                     )
+                    response_metrics = _build_response_metrics(
+                        agent,
+                        round((time.monotonic() - turn_started) * 1000),
+                    )
+                    if isinstance(result, dict):
+                        result["response_metrics"] = response_metrics
+                        _persist_response_metrics(agent, result, response_metrics)
                     usage = {
                         "input_tokens": getattr(agent, "session_prompt_tokens", 0) or 0,
                         "output_tokens": getattr(agent, "session_completion_tokens", 0) or 0,
@@ -6577,12 +6740,17 @@ class APIServerAdapter(BasePlatformAdapter):
                     # /v1/runs has its own branch in its executor.
                     logger.warning("Provider authentication failed for session=%s: %s",
                                    session_id or "", exc)
+                    response_metrics = _build_response_metrics(
+                        agent,
+                        round((time.monotonic() - turn_started) * 1000),
+                    )
                     return (
                         {
                             "final_response": f"⚠️ Provider authentication failed: {exc}",
                             "messages": [],
                             "api_calls": 0,
                             "tools": [],
+                            "response_metrics": response_metrics,
                         },
                         {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
                     )

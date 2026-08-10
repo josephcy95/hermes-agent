@@ -12626,11 +12626,22 @@ def _model_picker_context(agent):
                 exc_info=True,
             )
 
+    current_reasoning_effort = None
+    reasoning_config = getattr(agent, "reasoning_config", None) if agent else None
+    if isinstance(reasoning_config, dict):
+        if reasoning_config.get("enabled") is False:
+            current_reasoning_effort = "none"
+        else:
+            effort = reasoning_config.get("effort")
+            if isinstance(effort, str) and effort.strip():
+                current_reasoning_effort = effort.strip().lower()
+
     return ctx.with_overrides(
         current_provider=provider,
         current_model=(getattr(agent, "model", "") if agent else "")
         or _resolve_model(),
         current_base_url=base_url,
+        current_reasoning_effort=current_reasoning_effort,
     )
 
 
