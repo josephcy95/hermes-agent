@@ -13,6 +13,7 @@ Exposes an HTTP server with endpoints:
 - GET/PATCH/DELETE /api/sessions/{session_id} — read/update/delete a session
 - GET  /api/sessions/{session_id}/messages — read session message history
 - POST /api/sessions/{session_id}/fork — full or point-in-time SessionDB fork
+- POST /api/sessions/{session_id}/steer — steer the active persisted-session run
 - POST /api/sessions/{session_id}/chat[/stream] — chat with a persisted session
 - POST /v1/runs                    — start a run, returns run_id immediately (202)
 - GET  /v1/runs/{run_id}           — retrieve current run status
@@ -1534,6 +1535,14 @@ class APIServerAdapter(BasePlatformAdapter):
         self._run_stream_subscribers: set[str] = set()
         # Active run agent/task references for stop support
         self._active_run_agents: Dict[str, Any] = {}
+        # AIAgents currently executing a persisted API session turn. The key
+        # includes the URL-selected profile because multiplexed profiles can
+        # legitimately reuse the same session ID in separate SessionDBs.
+        # Access is protected by a threading lock: _run_agent() installs and
+        # clears entries from its executor thread while the steer handler runs
+        # on aiohttp's event-loop thread.
+        self._active_session_agents: Dict[tuple[str, str], Any] = {}
+        self._active_session_agents_lock = threading.RLock()
         self._active_run_tasks: Dict[str, "asyncio.Task"] = {}
         # Stop is cooperative: the executor thread may outlive the HTTP request.
         self._stopping_run_ids: set[str] = set()
@@ -1642,6 +1651,78 @@ class APIServerAdapter(BasePlatformAdapter):
             except Exception as exc:
                 logger.debug("[api_server] failed interrupting active agent: %s", exc)
         return interrupted
+
+    @staticmethod
+    def _active_session_agent_key(
+        session_id: Optional[str], profile: Optional[str]
+    ) -> Optional[tuple[str, str]]:
+        """Return the profile-isolated key used by the session steer map."""
+        if not isinstance(session_id, str) or not session_id:
+            return None
+        # Unprefixed requests are always the default profile, including when
+        # multiplexing is enabled. Treat an explicit ``default`` prefix the
+        # same way so the two URL forms cannot create separate steer targets.
+        return (profile if profile and profile != "default" else "default", session_id)
+
+    def _register_active_session_agent(
+        self, session_id: Optional[str], agent: Any, profile: Optional[str]
+    ) -> Optional[tuple[str, str]]:
+        """Publish an agent as the current run for a persisted session.
+
+        The identity check in ``_clear_active_session_agent`` means an older
+        concurrent run cannot remove a newer run's mapping for the same
+        profile/session key. The API has historically allowed concurrent runs
+        to share a session, so latest registration wins deterministically for
+        a steer request without changing that behavior.
+        """
+        key = self._active_session_agent_key(session_id, profile)
+        if key is None:
+            return None
+        with self._active_session_agents_lock:
+            self._active_session_agents[key] = agent
+        return key
+
+    def _clear_active_session_agent(
+        self, key: Optional[tuple[str, str]], agent: Any
+    ) -> None:
+        """Remove an agent only if it still owns its profile/session slot."""
+        if key is None:
+            return
+        with self._active_session_agents_lock:
+            if self._active_session_agents.get(key) is agent:
+                self._active_session_agents.pop(key, None)
+
+    def _steer_active_session_agent(
+        self, session_id: str, text: str, profile: Optional[str]
+    ) -> tuple[bool, str]:
+        """Call ``AIAgent.steer`` for the active profile/session, if any.
+
+        The lookup and call share one lock with lifecycle registration/clear so
+        a completed turn cannot be mistaken for a different session or profile
+        while the mapping is being replaced. ``AIAgent.steer`` itself is
+        thread-safe and deliberately does not interrupt the running turn.
+        """
+        key = self._active_session_agent_key(session_id, profile)
+        if key is None:
+            return False, "no_active_run"
+        with self._active_session_agents_lock:
+            agent = self._active_session_agents.get(key)
+            if agent is None:
+                return False, "no_active_run"
+            steer = getattr(agent, "steer", None)
+            if not callable(steer):
+                return False, "agent_not_steer_capable"
+            try:
+                accepted = bool(steer(text))
+            except Exception:
+                logger.warning(
+                    "Session steer failed for profile=%s session=%s",
+                    key[0],
+                    key[1],
+                    exc_info=True,
+                )
+                return False, "steer_failed"
+            return accepted, "" if accepted else "steer_rejected"
 
     @staticmethod
     def _gateway_is_draining() -> bool:
@@ -2168,6 +2249,7 @@ class APIServerAdapter(BasePlatformAdapter):
             ("DELETE", "/api/sessions/{session_id}", self._handle_delete_session),
             ("GET", "/api/sessions/{session_id}/messages", self._handle_session_messages),
             ("POST", "/api/sessions/{session_id}/fork", self._handle_fork_session),
+            ("POST", "/api/sessions/{session_id}/steer", self._handle_session_steer),
             ("POST", "/api/sessions/{session_id}/chat", self._handle_session_chat),
             ("POST", "/api/sessions/{session_id}/chat/stream", self._handle_session_chat_stream),
             ("POST", "/api/sessions/{session_id}/model", self._handle_session_model_lock),
@@ -3241,6 +3323,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "session_chat_streaming": True,
                 "session_fork": True,
                 "session_fork_through_message_id": True,
+                "session_steer": True,
                 "session_relationship_type": True,
                 "session_model_lock": True,
                 "admin_config_rw": False,
@@ -3274,6 +3357,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "session_delete": {"method": "DELETE", "path": "/api/sessions/{session_id}"},
                 "session_messages": {"method": "GET", "path": "/api/sessions/{session_id}/messages"},
                 "session_fork": {"method": "POST", "path": "/api/sessions/{session_id}/fork"},
+                "session_steer": {"method": "POST", "path": "/api/sessions/{session_id}/steer"},
                 "session_chat": {"method": "POST", "path": "/api/sessions/{session_id}/chat"},
                 "session_chat_stream": {"method": "POST", "path": "/api/sessions/{session_id}/chat/stream"},
                 "session_model_lock": {"method": "POST", "path": "/api/sessions/{session_id}/model"},
@@ -3791,6 +3875,85 @@ class APIServerAdapter(BasePlatformAdapter):
                 relationship_type=relationship_types.get(session.get("id")),
             ),
         })
+
+    async def _handle_session_steer(self, request: "web.Request") -> "web.Response":
+        """POST /api/sessions/{session_id}/steer.
+
+        Steering is intentionally narrower than session chat: it accepts only
+        one plain-text field and never starts a turn or interrupts the active
+        one. ``AIAgent.steer`` stores the text for application after the next
+        tool batch.
+        """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        session_id = request.match_info["session_id"]
+        _, session_err = await self._get_existing_session_or_404(session_id)
+        if session_err:
+            return session_err
+
+        body, body_err = await self._read_json_body(request)
+        if body_err:
+            return body_err
+        unknown = sorted(set(body) - {"text"})
+        if unknown:
+            return web.json_response(
+                _openai_error(
+                    f"Unsupported session steer fields: {', '.join(unknown)}",
+                    code="unsupported_session_steer_field",
+                ),
+                status=400,
+            )
+
+        raw_text = body.get("text")
+        if not isinstance(raw_text, str):
+            return web.json_response(
+                _openai_error(
+                    "'text' must be a non-empty plain-text string",
+                    code="invalid_session_steer_text",
+                ),
+                status=400,
+            )
+        text = raw_text.strip()
+        if not text:
+            return web.json_response(
+                _openai_error(
+                    "'text' must be a non-empty plain-text string",
+                    code="invalid_session_steer_text",
+                ),
+                status=400,
+            )
+        if len(text) > MAX_NORMALIZED_TEXT_LENGTH:
+            return web.json_response(
+                _openai_error(
+                    f"'text' exceeds the {MAX_NORMALIZED_TEXT_LENGTH}-character limit",
+                    code="session_steer_text_too_long",
+                ),
+                status=400,
+            )
+
+        accepted, reason = self._steer_active_session_agent(
+            session_id,
+            text,
+            _api_request_profile.get(),
+        )
+        payload = {
+            "object": "hermes.session.steer",
+            "session_id": session_id,
+            "status": "queued" if accepted else "rejected",
+            "text": text,
+        }
+        if accepted:
+            return web.json_response(payload, status=202)
+
+        payload["reason"] = reason or "steer_rejected"
+        payload["message"] = (
+            "No active steer-capable run exists for this session."
+            if reason in {"no_active_run", "agent_not_steer_capable"}
+            else "The active session run rejected the steer."
+        )
+        return web.json_response(payload, status=409)
 
     async def _handle_patch_session(self, request: "web.Request") -> "web.Response":
         """PATCH /api/sessions/{session_id} — update client-safe session metadata."""
@@ -6589,6 +6752,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     session_id=session_id or "",
                 )
                 agent = None
+                active_session_key = None
                 try:
                     agent = self._create_agent(
                         ephemeral_system_prompt=ephemeral_system_prompt,
@@ -6614,6 +6778,11 @@ class APIServerAdapter(BasePlatformAdapter):
                     # runs its own agent lifecycle and doesn't go through
                     # TurnRunner, so it needs its own baseline.
                     _publish_turn_process_ownership(agent, effective_task_id)
+                    active_session_key = self._register_active_session_agent(
+                        session_id,
+                        agent,
+                        request_profile,
+                    )
                     # Shutdown interrupt coverage (#63529).  Registering here,
                     # once, covers every _run_agent() caller — the same reason
                     # the _ProviderAuthResolutionError handler below lives here
@@ -6761,6 +6930,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     # running on purpose. Mirrors the same race-window guard
                     # in gateway/run.py's _run_sync_with_timeout_lifecycle.
                     if agent is not None:
+                        self._clear_active_session_agent(active_session_key, agent)
                         _clear_turn_process_ownership(agent)
                         # Symmetric with the registration above: the turn is
                         # over, so it must not be interrupted by a later

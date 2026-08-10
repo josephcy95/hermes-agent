@@ -17,6 +17,7 @@ import json
 import os
 import stat
 import sys
+import threading
 import time
 import types
 import uuid
@@ -30,6 +31,7 @@ from aiohttp.test_utils import TestClient, TestServer
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.api_server import (
     APIServerAdapter,
+    MAX_NORMALIZED_TEXT_LENGTH,
     ResponseStore,
     _build_response_metrics,
     _IdempotencyCache,
@@ -314,6 +316,7 @@ def _create_app(adapter: APIServerAdapter) -> web.Application:
     app.router.add_get("/v1/capabilities", adapter._handle_capabilities)
     app.router.add_get("/v1/skills", adapter._handle_skills)
     app.router.add_get("/v1/toolsets", adapter._handle_toolsets)
+    app.router.add_post("/api/sessions/{session_id}/steer", adapter._handle_session_steer)
     app.router.add_post("/api/sessions/{session_id}/chat", adapter._handle_session_chat)
     app.router.add_post("/api/sessions/{session_id}/chat/stream", adapter._handle_session_chat_stream)
     app.router.add_post("/v1/chat/completions", adapter._handle_chat_completions)
@@ -878,11 +881,176 @@ class TestCapabilitiesEndpoint:
             assert data["features"]["response_metrics"] is True
             assert data["features"]["response_metrics_persistence"] is True
             assert data["features"]["session_context_usage"] is True
+            assert data["features"]["session_steer"] is True
             assert data["features"]["session_continuity_header"] == "X-Hermes-Session-Id"
             assert data["endpoints"]["run_status"]["path"] == "/v1/runs/{run_id}"
             assert data["endpoints"]["model_options"] == {"method": "GET", "path": "/api/model/options"}
             assert data["endpoints"]["skills"] == {"method": "GET", "path": "/v1/skills"}
             assert data["endpoints"]["toolsets"] == {"method": "GET", "path": "/v1/toolsets"}
+            assert data["endpoints"]["session_steer"] == {
+                "method": "POST",
+                "path": "/api/sessions/{session_id}/steer",
+            }
+
+
+# ---------------------------------------------------------------------------
+# POST /api/sessions/{session_id}/steer
+# ---------------------------------------------------------------------------
+
+
+class TestSessionSteerEndpoint:
+    @staticmethod
+    async def _existing_session(_session_id):
+        return {"id": "steer-session"}, None
+
+    @staticmethod
+    async def _missing_session(_session_id):
+        return None, web.json_response(
+            {"error": {"message": "Session not found", "code": "session_not_found"}},
+            status=404,
+        )
+
+    @pytest.mark.asyncio
+    async def test_requires_auth(self, auth_adapter):
+        app = _create_app(auth_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/api/sessions/steer-session/steer",
+                json={"text": "also inspect the logs"},
+            )
+        assert resp.status == 401
+
+    @pytest.mark.asyncio
+    async def test_missing_session_returns_404(self, adapter, monkeypatch):
+        monkeypatch.setattr(
+            adapter,
+            "_get_existing_session_or_404",
+            self._missing_session,
+        )
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/api/sessions/missing-session/steer",
+                json={"text": "this must not start a run"},
+            )
+            payload = await resp.json()
+        assert resp.status == 404
+        assert payload["error"]["code"] == "session_not_found"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "body",
+        [
+            {},
+            {"text": "   "},
+            {"text": 42},
+            {"text": ["not plain text"]},
+            {"text": "x" * (MAX_NORMALIZED_TEXT_LENGTH + 1)},
+            {"text": "valid", "unexpected": True},
+        ],
+    )
+    async def test_rejects_invalid_text_body(self, adapter, monkeypatch, body):
+        monkeypatch.setattr(
+            adapter,
+            "_get_existing_session_or_404",
+            self._existing_session,
+        )
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/api/sessions/steer-session/steer",
+                json=body,
+            )
+            payload = await resp.json()
+        assert resp.status == 400
+        assert payload["error"]["type"] == "invalid_request_error"
+
+    @pytest.mark.asyncio
+    async def test_active_run_accepts_steer_and_clears_mapping(
+        self, adapter, monkeypatch
+    ):
+        session_id = "steer-session"
+        monkeypatch.setattr(
+            adapter,
+            "_get_existing_session_or_404",
+            self._existing_session,
+        )
+        started = threading.Event()
+        release = threading.Event()
+        steers = []
+
+        class FakeAgent:
+            session_prompt_tokens = 1
+            session_completion_tokens = 2
+            session_total_tokens = 3
+
+            def run_conversation(self, **_kwargs):
+                started.set()
+                assert release.wait(5)
+                return {"final_response": "done"}
+
+            def steer(self, text):
+                steers.append(text)
+                return True
+
+        fake_agent = FakeAgent()
+        monkeypatch.setattr(adapter, "_create_agent", lambda **_kwargs: fake_agent)
+
+        run_task = asyncio.create_task(
+            adapter._run_agent(
+                user_message="start",
+                conversation_history=[],
+                session_id=session_id,
+            )
+        )
+        try:
+            assert await asyncio.to_thread(started.wait, 5)
+            app = _create_app(adapter)
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.post(
+                    f"/api/sessions/{session_id}/steer",
+                    json={"text": "also inspect the logs"},
+                )
+                payload = await resp.json()
+            assert resp.status == 202
+            assert payload == {
+                "object": "hermes.session.steer",
+                "session_id": session_id,
+                "status": "queued",
+                "text": "also inspect the logs",
+            }
+            assert steers == ["also inspect the logs"]
+        finally:
+            release.set()
+            await run_task
+
+        assert adapter._active_session_agents == {}
+
+    @pytest.mark.asyncio
+    async def test_no_active_run_returns_deterministic_rejection(
+        self, adapter, monkeypatch
+    ):
+        monkeypatch.setattr(
+            adapter,
+            "_get_existing_session_or_404",
+            self._existing_session,
+        )
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/api/sessions/steer-session/steer",
+                json={"text": "do not silently queue a new turn"},
+            )
+            payload = await resp.json()
+        assert resp.status == 409
+        assert payload == {
+            "object": "hermes.session.steer",
+            "session_id": "steer-session",
+            "status": "rejected",
+            "text": "do not silently queue a new turn",
+            "reason": "no_active_run",
+            "message": "No active steer-capable run exists for this session.",
+        }
 
 
 # ---------------------------------------------------------------------------
